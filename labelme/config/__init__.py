@@ -66,7 +66,8 @@ def get_config(config_file_or_yaml=None, config_from_args=None):
             with open(config_from_yaml) as f:
                 logger.info("Loading config file from: {}".format(config_from_yaml))
                 config_from_yaml = yaml.safe_load(f)
-        update_dict(config, config_from_yaml, validate_item=validate_config_item)
+        if config_from_yaml:
+            update_dict(config, config_from_yaml, validate_item=validate_config_item)
 
     # 3. command line argument or specified config file
     if config_from_args is not None:

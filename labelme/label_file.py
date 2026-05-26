@@ -94,8 +94,8 @@ class LabelFile(object):
                     imageData = utils.img_data_to_png_data(imageData)
             else:
                 # relative path from label file to relative path from cwd
-                if osp.isfile(data["imagePath"]):
-                    imagePath = osp.join(osp.dirname(filename), data["imagePath"])
+                imagePath = osp.join(osp.dirname(filename), data["imagePath"])
+                if osp.isfile(imagePath):
                     imageData = self.load_image_file(imagePath)
                 else:
                     imagePath = filename.split('.json')[0] + '.jpg'
@@ -115,7 +115,7 @@ class LabelFile(object):
                     flags=s.get("flags", {}),
                     description=s.get("description"),
                     group_id=s.get("group_id"),
-                    track_id=s.get("track_id"),
+                    track_id=s.get("track_id") or s.get("group_id"),
                     mask=utils.img_b64_to_arr(s["mask"]) if s.get("mask") else None,
                     # other_data={k: v for k, v in s.items() if k not in shape_keys},
                 )

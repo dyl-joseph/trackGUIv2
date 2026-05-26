@@ -367,7 +367,7 @@ shortcuts:
   create_point: null
   create_linestrip: null
   edit_polygon: Ctrl+J
-  delete_polygon: Delete
+  delete_polygon: Shift+D
   duplicate_polygon: Ctrl+D
   copy_polygon: Ctrl+C
   paste_polygon: Ctrl+V

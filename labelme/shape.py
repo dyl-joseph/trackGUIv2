@@ -268,6 +268,15 @@ class Shape(object):
             painter.drawPath(negative_vrtx_path)
             painter.fillPath(negative_vrtx_path, QtGui.QColor(255, 0, 0, 255))
 
+            tid = self.track_id if self.track_id is not None else self.group_id
+            if tid is not None:
+                font = painter.font()
+                font.setPointSizeF(max(8, 10 / self.scale))
+                painter.setFont(font)
+                br = self.boundingRect()
+                painter.setPen(QtGui.QColor(255, 255, 255))
+                painter.drawText(int(br.x()), int(br.y()) - 2, str(tid))
+
     def drawVertex(self, path, i):
         d = self.point_size / self.scale
         shape = self.point_type

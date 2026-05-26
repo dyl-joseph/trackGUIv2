@@ -2,6 +2,7 @@
 
 import functools
 import html
+import json
 import math
 import os
 import os.path as osp
@@ -10,10 +11,12 @@ import webbrowser
 
 import imgviz
 import natsort
+import numpy as np
 from qtpy import QtCore
 from qtpy import QtGui
 from qtpy import QtWidgets
 from qtpy.QtCore import Qt
+from scipy.optimize import linear_sum_assignment
 
 from labelme import PY2
 from labelme import __appname__
@@ -23,32 +26,28 @@ from labelme.label_file import LabelFile
 from labelme.label_file import LabelFileError
 from labelme.logger import logger
 from labelme.shape import Shape
+from labelme.track_algo import KalmanBoxTracker
+from labelme.track_algo import SORT_main
 from labelme.widgets import BrightnessContrastDialog
 from labelme.widgets import Canvas
+from labelme.widgets import DeletionDialog
 from labelme.widgets import FileDialogPreview
-from labelme.widgets import LabelDialog
 from labelme.widgets import IDDialog
-from labelme.widgets import LabelListWidget
-from labelme.widgets import LabelListWidgetItem
 from labelme.widgets import IDListWidget
 from labelme.widgets import IDListWidgetItem
-from labelme.widgets import NavigationWidget
-from labelme.widgets import TrackDialog
 from labelme.widgets import InterpolationDialog
-from labelme.widgets import IterpolationRefineWidget
 from labelme.widgets import InterpolationRefineInfo_Dialog
-from labelme.widgets import DeletionDialog
+from labelme.widgets import IterpolationRefineWidget
+from labelme.widgets import LabelDialog
+from labelme.widgets import LabelListWidget
+from labelme.widgets import LabelListWidgetItem
+from labelme.widgets import NavigationWidget
 from labelme.widgets import ToolBar
+from labelme.widgets import TrackDialog
 from labelme.widgets import UniqueLabelQListWidget
 from labelme.widgets import ZoomWidget
 
 from . import utils
-
-import numpy as np
-import json
-from labelme.track_algo import SORT_main
-from labelme.track_algo import KalmanBoxTracker
-from scipy.optimize import linear_sum_assignment
 
 # FIXME
 # - [medium] Set max zoom value to something big enough for FitWidth/Window
@@ -130,7 +129,7 @@ class MainWindow(QtWidgets.QMainWindow):
             sort_ids=self._config["sort_labels"],
             show_text_field=self._config["show_label_text_field"],
             completion=self._config["label_completion"],
-            fit_to_content=self._config["fit_to_content"]
+            fit_to_content=self._config["fit_to_content"],
         )
 
         self.labelList = LabelListWidget()
@@ -161,10 +160,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.navigation_dock = QtWidgets.QDockWidget(self.tr("Navigation"), self)
         self.navigation_dock.setObjectName("Navigation")
         self.navigation_dock.setWidget(self.navigation_list)
-        
+
         self.interpolationrefine_list = IterpolationRefineWidget()
         self.interpolationrefine_list.button.clicked.connect(self.editIR_info)
-        self.interpolationrefine_dock = QtWidgets.QDockWidget(self.tr("Interpolation Refinement"), self)
+        self.interpolationrefine_dock = QtWidgets.QDockWidget(
+            self.tr("Interpolation Refinement"), self
+        )
         self.interpolationrefine_dock.setObjectName("Interpolation Refinement")
         self.interpolationrefine_dock.setWidget(self.interpolationrefine_list)
         self.ir_name = "None"
@@ -194,9 +195,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.uniqLabelList = UniqueLabelQListWidget()
         self.uniqLabelList.setToolTip(
-            self.tr(
-                "Select label to start annotating for it. " "Press 'Esc' to deselect."
-            )
+            self.tr("Select label to start annotating for it. Press 'Esc' to deselect.")
         )
         if self._config["labels"]:
             for label in self._config["labels"]:
@@ -263,7 +262,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._config[dock]["show"] is False:
                 getattr(self, dock).setVisible(False)
 
-        
         self.addDockWidget(Qt.RightDockWidgetArea, self.navigation_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.interpolationrefine_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.flag_dock)
@@ -438,11 +436,13 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled=False,
         )
         createAiPolygonMode.changed.connect(
-            lambda: self.canvas.initializeAiModel(
-                name=self._selectAiModelComboBox.currentText()
+            lambda: (
+                self.canvas.initializeAiModel(
+                    name=self._selectAiModelComboBox.currentText()
+                )
+                if self.canvas.createMode == "ai_polygon"
+                else None
             )
-            if self.canvas.createMode == "ai_polygon"
-            else None
         )
         createAiMaskMode = action(
             self.tr("Create AI-Mask"),
@@ -453,11 +453,13 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled=False,
         )
         createAiMaskMode.changed.connect(
-            lambda: self.canvas.initializeAiModel(
-                name=self._selectAiModelComboBox.currentText()
+            lambda: (
+                self.canvas.initializeAiModel(
+                    name=self._selectAiModelComboBox.currentText()
+                )
+                if self.canvas.createMode == "ai_mask"
+                else None
             )
-            if self.canvas.createMode == "ai_mask"
-            else None
         )
         editMode = action(
             self.tr("Edit Polygons"),
@@ -672,7 +674,7 @@ class MainWindow(QtWidgets.QMainWindow):
             shortcuts["edit_id"],
             "edit",
             self.tr("Modify the ID of the selected polygon"),
-            enabled=False
+            enabled=False,
         )
 
         call_sort = action(
@@ -833,7 +835,7 @@ class MainWindow(QtWidgets.QMainWindow):
             help=self.menu(self.tr("&Help")),
             recentFiles=QtWidgets.QMenu(self.tr("Open &Recent")),
             labelList=labelMenu,
-            IDList=IDMenu
+            IDList=IDMenu,
         )
 
         utils.addActions(
@@ -883,7 +885,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         utils.addActions(
             self.menus.track,
-            (call_interpolation,call_sort,call_deletion),
+            (call_interpolation, call_sort, call_deletion),
         )
 
         self.menus.file.aboutToShow.connect(self.updateFileMenu)
@@ -921,11 +923,13 @@ class MainWindow(QtWidgets.QMainWindow):
             model_index = 0
         self._selectAiModelComboBox.setCurrentIndex(model_index)
         self._selectAiModelComboBox.currentIndexChanged.connect(
-            lambda: self.canvas.initializeAiModel(
-                name=self._selectAiModelComboBox.currentText()
+            lambda: (
+                self.canvas.initializeAiModel(
+                    name=self._selectAiModelComboBox.currentText()
+                )
+                if self.canvas.createMode in ["ai_polygon", "ai_mask"]
+                else None
             )
-            if self.canvas.createMode in ["ai_polygon", "ai_mask"]
-            else None
         )
 
         self.tools = self.toolbar("Tools")
@@ -1225,18 +1229,19 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self,
         )
         dialog.exec_()
-        
+
         self.ir_name = dialog.name
         self.ir_id = dialog.id
-        
-        self.interpolationrefine_list.statusBar.showMessage(f'Name: {self.ir_name} | ID: {self.ir_id}')
-        
-        
+
+        self.interpolationrefine_list.statusBar.showMessage(
+            f"Name: {self.ir_name} | ID: {self.ir_id}"
+        )
+
     def SORT(self, item=None):
         def convert(box):
             w = abs(box[1][0] - box[0][0])
             h = abs(box[1][1] - box[0][1])
-            return [box[0][0],box[0][1],w,h]
+            return [box[0][0], box[0][1], w, h]
 
         dialog = TrackDialog(
             parent=self,
@@ -1247,83 +1252,150 @@ class MainWindow(QtWidgets.QMainWindow):
         # + start by using the current frame's track annotation
         # + start from scratch without track annotation
         track_option = dialog.option_value
-        
+
         # print frame shortage here
         # ...
 
-        if track_option != 0:   
+        if track_option != 0:
             # get the index of current item
             items = self.fileListWidget.selectedItems()
             item = items[0]
             currIndex = self.imageList.index(str(item.text()))
 
             # get label list .json
-            if track_option == 1:   # start from beginning
-                labelList = [osp.splitext(img_p)[0] + ".json" for img_p in self.imageList]
+            if track_option == 1:  # start from beginning
+                labelList = [
+                    osp.splitext(img_p)[0] + ".json" for img_p in self.imageList
+                ]
             else:
-                labelList = [osp.splitext(img_p)[0] + ".json" for img_p in self.imageList][currIndex:]
-            
+                labelList = [
+                    osp.splitext(img_p)[0] + ".json" for img_p in self.imageList
+                ][currIndex:]
+
             # convert label to Track Evaluation
             lines = []
             frame_id = 1
             for jdx, json_path in enumerate(labelList):
-                if jdx == 0:    # first frame 
-                    bboxes = [ [[self.IDList[idx].shape().points[0].x(),\
-                                self.IDList[idx].shape().points[0].y()],\
-                                [self.IDList[idx].shape().points[1].x(),\
-                                self.IDList[idx].shape().points[1].y()]]       for idx in range(len(self.IDList))]
+                if jdx == 0:  # first frame
+                    bboxes = [
+                        [
+                            [
+                                self.IDList[idx].shape().points[0].x(),
+                                self.IDList[idx].shape().points[0].y(),
+                            ],
+                            [
+                                self.IDList[idx].shape().points[1].x(),
+                                self.IDList[idx].shape().points[1].y(),
+                            ],
+                        ]
+                        for idx in range(len(self.IDList))
+                    ]
                     bboxes_xywh = [convert(bboxes[i]) for i in range(len(bboxes))]
-                    
-                    if track_option == 2: # start with current annotation
-                        track_ids = [self.IDList[idx].text() for idx in range(len(self.IDList))]
-                        int_track_ids = [int(self.IDList[idx].text()) for idx in range(len(self.IDList))]
-                        
-                        if '-1' in track_ids:
+
+                    if track_option == 2:  # start with current annotation
+                        track_ids = [
+                            self.IDList[idx].text() for idx in range(len(self.IDList))
+                        ]
+                        int_track_ids = [
+                            int(self.IDList[idx].text())
+                            for idx in range(len(self.IDList))
+                        ]
+
+                        if "-1" in track_ids:
                             self.errorMessage(
                                 "Track IDs",
                                 "You must label all objects' IDs.",
                             )
                             return
                         for l in range(len(bboxes_xywh)):
-                            lines.append([frame_id,int(track_ids[l]),bboxes_xywh[l][0],bboxes_xywh[l][1],bboxes_xywh[l][2],bboxes_xywh[l][3],1,-1,-1,-1])
-                    else:   # start with NO annotation
+                            lines.append(
+                                [
+                                    frame_id,
+                                    int(track_ids[l]),
+                                    bboxes_xywh[l][0],
+                                    bboxes_xywh[l][1],
+                                    bboxes_xywh[l][2],
+                                    bboxes_xywh[l][3],
+                                    1,
+                                    -1,
+                                    -1,
+                                    -1,
+                                ]
+                            )
+                    else:  # start with NO annotation
                         for l in range(len(bboxes_xywh)):
-                            lines.append([frame_id,-1,bboxes_xywh[l][0],bboxes_xywh[l][1],bboxes_xywh[l][2],bboxes_xywh[l][3],1,-1,-1,-1])
-                else:       # next frames # all ids are -1
+                            lines.append(
+                                [
+                                    frame_id,
+                                    -1,
+                                    bboxes_xywh[l][0],
+                                    bboxes_xywh[l][1],
+                                    bboxes_xywh[l][2],
+                                    bboxes_xywh[l][3],
+                                    1,
+                                    -1,
+                                    -1,
+                                    -1,
+                                ]
+                            )
+                else:  # next frames # all ids are -1
                     with open(json_path) as file:
                         data = json.load(file)
 
-                    bboxes = [data['shapes'][i]['points'] for i in range(len(data['shapes']))]
+                    bboxes = [
+                        data["shapes"][i]["points"] for i in range(len(data["shapes"]))
+                    ]
                     # need boxes in x,y,w,h
                     bboxes_xywh = [convert(bboxes[i]) for i in range(len(bboxes))]
 
                     # frame_id, track_id, x_top_left, y_top_left, width, height,1,-1,-1,-1
                     for l in range(len(bboxes_xywh)):
-                        lines.append([frame_id,-1,bboxes_xywh[l][0],bboxes_xywh[l][1],bboxes_xywh[l][2],bboxes_xywh[l][3],1,-1,-1,-1])
+                        lines.append(
+                            [
+                                frame_id,
+                                -1,
+                                bboxes_xywh[l][0],
+                                bboxes_xywh[l][1],
+                                bboxes_xywh[l][2],
+                                bboxes_xywh[l][3],
+                                1,
+                                -1,
+                                -1,
+                                -1,
+                            ]
+                        )
                 frame_id += 1
             seq_dets = np.array(lines).astype(float)
-            
-            mot_tracker = SORT_main(max_age=10,min_hits=0,iou_threshold=0.3)
+
+            mot_tracker = SORT_main(max_age=10, min_hits=0, iou_threshold=0.3)
             mot_tracker.trackers = []
             KalmanBoxTracker.count = 0
             track_results = []
             if track_option == 2:
-                for idx in range(len(seq_dets[seq_dets[:, 0]==1])):
-                    dets = seq_dets[seq_dets[:, 0]==1,2:7][idx:idx+1]   # original setting: x,y,w,h top left width height
-                    det_id = seq_dets[seq_dets[:, 0]==1,1][idx]
-                    dets[:, 2:4] += dets[:, 0:2] #convert to [x1,y1,w,h] to [x1,y1,x2,y2]
-                    KalmanBoxTracker.count = max(int_track_ids)+1
+                for idx in range(len(seq_dets[seq_dets[:, 0] == 1])):
+                    dets = seq_dets[seq_dets[:, 0] == 1, 2:7][
+                        idx : idx + 1
+                    ]  # original setting: x,y,w,h top left width height
+                    det_id = seq_dets[seq_dets[:, 0] == 1, 1][idx]
+                    dets[:, 2:4] += dets[
+                        :, 0:2
+                    ]  # convert to [x1,y1,w,h] to [x1,y1,x2,y2]
+                    KalmanBoxTracker.count = max(int_track_ids) + 1
                     KalmanBoxTracker.id = 0
-                    mot_tracker.trackers.append(KalmanBoxTracker(dets[0],id=det_id))
-            
-            for frame in range(int(seq_dets[:,0].max())):
-                frame += 1 #detection and frame numbers begin at 1
-                dets = seq_dets[seq_dets[:, 0]==frame, 2:7]   # original setting: x,y,w,h top left width height
-                dets[:, 2:4] += dets[:, 0:2] #convert to [x1,y1,w,h] to [x1,y1,x2,y2]
+                    mot_tracker.trackers.append(KalmanBoxTracker(dets[0], id=det_id))
+
+            for frame in range(int(seq_dets[:, 0].max())):
+                frame += 1  # detection and frame numbers begin at 1
+                dets = seq_dets[
+                    seq_dets[:, 0] == frame, 2:7
+                ]  # original setting: x,y,w,h top left width height
+                dets[:, 2:4] += dets[:, 0:2]  # convert to [x1,y1,w,h] to [x1,y1,x2,y2]
                 trackers = mot_tracker.update(dets)
 
                 for d in trackers:
-                    track_results.append([frame,d[4],d[0],d[1],d[2]-d[0],d[3]-d[1]])
+                    track_results.append(
+                        [frame, d[4], d[0], d[1], d[2] - d[0], d[3] - d[1]]
+                    )
             track_results = np.array(track_results).astype(int)
 
             lf = LabelFile()
@@ -1332,23 +1404,25 @@ class MainWindow(QtWidgets.QMainWindow):
             for jdx, json_path in enumerate(labelList):
                 loaded_label = LabelFile(json_path)
                 loaded_shape = loaded_label.shapes
-                frame = jdx+1
-                track_ids = track_results[track_results[:, 0]==frame,1]
-                track_xy = track_results[track_results[:, 0]==frame,2:4]
-                shape_xy = [loaded_shape[idx]['points'][0] for idx in range(len(loaded_shape))]
+                frame = jdx + 1
+                track_ids = track_results[track_results[:, 0] == frame, 1]
+                track_xy = track_results[track_results[:, 0] == frame, 2:4]
+                shape_xy = [
+                    loaded_shape[idx]["points"][0] for idx in range(len(loaded_shape))
+                ]
 
                 hungarian_matrix = []
                 for adx in range(len(shape_xy)):
                     row = []
                     for bdx in range(len(track_xy)):
-                        row.append( np.sum(np.abs(shape_xy[adx]-track_xy[bdx])) )
+                        row.append(np.sum(np.abs(shape_xy[adx] - track_xy[bdx])))
                     hungarian_matrix.append(row)
-                shape_m,track_m = linear_sum_assignment(np.array(hungarian_matrix))
+                shape_m, track_m = linear_sum_assignment(np.array(hungarian_matrix))
 
                 for idx in range(len(shape_xy)):
-                    loaded_shape[idx]['track_id'] = str(track_ids[track_m[idx]])
-                
-                imagePath = osp.splitext(json_path)[0] + ".jpg"            
+                    loaded_shape[idx]["track_id"] = str(track_ids[track_m[idx]])
+
+                imagePath = osp.splitext(json_path)[0] + ".jpg"
                 lf.save(
                     filename=json_path,
                     shapes=loaded_shape,
@@ -1358,94 +1432,104 @@ class MainWindow(QtWidgets.QMainWindow):
                     imageWidth=self.image.width(),
                     flags=flags,
                 )
-                
+
             # repaint the current frame
             self.informationMessage(
-                                "Track IDs",
-                                "ID Association is completed",
-                            )
+                "Track IDs",
+                "ID Association is completed",
+            )
             self.loadFile(self.filename)
 
     def INTERPOLATION(self, item=None):
         dialog = InterpolationDialog(
-            min_val=0,max_val=len(self.imageList),parent=self
+            min_val=0, max_val=len(self.imageList), parent=self
         )
         dialog.exec_()
         # import ipdb; ipdb.set_trace()
-        if (dialog.start_frame_cell.text() == '' or 
-            dialog.end_frame_cell.text() == '' or 
-            dialog.interval_cell.text() == '' or 
-            dialog.ID_cell.text() == '' or 
-            dialog.label_cell.text() == ''):
-
+        if (
+            dialog.start_frame_cell.text() == ""
+            or dialog.end_frame_cell.text() == ""
+            or dialog.interval_cell.text() == ""
+            or dialog.ID_cell.text() == ""
+            or dialog.label_cell.text() == ""
+        ):
             self.errorMessage(
-                                "Box Interpolation",
-                                "You must fill all the values in the form.",
-                            )
-            
+                "Box Interpolation",
+                "You must fill all the values in the form.",
+            )
+
             return
 
-        self.start_INP0 = start_frame = int(dialog.start_frame_cell.text().replace(" ", ""))
+        self.start_INP0 = start_frame = int(
+            dialog.start_frame_cell.text().replace(" ", "")
+        )
         self.end_INP0 = end_frame = int(dialog.end_frame_cell.text().replace(" ", ""))
-        self.interval_INPO = interval = int(dialog.interval_cell.text().replace(" ", ""))
+        self.interval_INPO = interval = int(
+            dialog.interval_cell.text().replace(" ", "")
+        )
         self.ID_INPO = ID = dialog.ID_cell.text().replace(" ", "")
         self.label_INPO = label = dialog.label_cell.text().replace(" ", "")
 
-        if end_frame - start_frame <=0:
+        if end_frame - start_frame <= 0:
             self.errorMessage(
-                                "Box Interpolation",
-                                "Start frame is higher than End frame.",
-                            )
-            
+                "Box Interpolation",
+                "Start frame is higher than End frame.",
+            )
+
             return
-        elif interval == 0 or interval > (end_frame-start_frame):
+        elif interval == 0 or interval > (end_frame - start_frame):
             self.errorMessage(
-                                "Box Interpolation",
-                                "Input Interval is bigger than Start-End frame gap (or is 0).",
-                            )
-            
+                "Box Interpolation",
+                "Input Interval is bigger than Start-End frame gap (or is 0).",
+            )
+
             return
         elif end_frame > len(self.imageList):
             self.errorMessage(
-                                "Box Interpolation",
-                                "Input End frame is out of the video length.",
-                            )
-            
+                "Box Interpolation",
+                "Input End frame is out of the video length.",
+            )
+
             return
-       
-        img_indices = np.linspace(start_frame-1,end_frame-1,num=int((end_frame-start_frame+1)/interval),dtype=int)
+
+        img_indices = np.linspace(
+            start_frame - 1,
+            end_frame - 1,
+            num=int((end_frame - start_frame + 1) / interval),
+            dtype=int,
+        )
 
         self.mode = "TRACK INTERPOLATION"
         self.INTERPOLATION_list = np.array(self.imageList)[img_indices].tolist()
         self.INTERPOLATION_filename = self.INTERPOLATION_list[0]
         self.filename = self.INTERPOLATION_filename
         self.loadFile(self.filename)
-    
+
     def OKAY(self, item=None):
         def convert(box):
-            return [box[0][0],box[0][1],box[1][0],box[1][1]]
-        
+            return [box[0][0], box[0][1], box[1][0], box[1][1]]
+
         def cvt_xyxy2xywh(old_bboxes):
             new_bboxes = np.zeros(old_bboxes.shape)
-            new_bboxes[:,0] = (old_bboxes[:,0]+old_bboxes[:,2])/2
-            new_bboxes[:,1] = (old_bboxes[:,1]+old_bboxes[:,3])/2
-            new_bboxes[:,2] = old_bboxes[:,2] - old_bboxes[:,0]
-            new_bboxes[:,3] = old_bboxes[:,3] - old_bboxes[:,1]
+            new_bboxes[:, 0] = (old_bboxes[:, 0] + old_bboxes[:, 2]) / 2
+            new_bboxes[:, 1] = (old_bboxes[:, 1] + old_bboxes[:, 3]) / 2
+            new_bboxes[:, 2] = old_bboxes[:, 2] - old_bboxes[:, 0]
+            new_bboxes[:, 3] = old_bboxes[:, 3] - old_bboxes[:, 1]
             return new_bboxes
 
         def cvt_xywh2xyxy(old_bboxes):
             new_bboxes = np.zeros(old_bboxes.shape)
-            dw = old_bboxes[:,2]/2
-            dh = old_bboxes[:,3]/2
-            new_bboxes[:,0] = old_bboxes[:,0] - dw
-            new_bboxes[:,1] = old_bboxes[:,1] - dh
-            new_bboxes[:,2] = old_bboxes[:,0] + dw
-            new_bboxes[:,3] = old_bboxes[:,1] + dh
+            dw = old_bboxes[:, 2] / 2
+            dh = old_bboxes[:, 3] / 2
+            new_bboxes[:, 0] = old_bboxes[:, 0] - dw
+            new_bboxes[:, 1] = old_bboxes[:, 1] - dh
+            new_bboxes[:, 2] = old_bboxes[:, 0] + dw
+            new_bboxes[:, 3] = old_bboxes[:, 1] + dh
             return new_bboxes
-        
+
         from sklearn.gaussian_process import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import RationalQuadratic 
-        
+        from sklearn.gaussian_process.kernels import RationalQuadratic
+
         if self.mode == "None" or self.mode == "NORMAL":
             return
         elif self.mode == "TRACK INTERPOLATION":
@@ -1455,24 +1539,40 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # print(self.start_INP0, self.end_INP0, self.ID_INPO, self.label_INPO)
 
-            labelList = [osp.splitext(img_p)[0] + ".json" for img_p in self.INTERPOLATION_list]
-            interpolatedList = self.imageList[self.start_INP0-1:self.end_INP0]
-            interpolatedList = [osp.splitext(img_p)[0] + ".json" for img_p in interpolatedList]
-            img_indices = np.linspace(self.start_INP0-1,self.end_INP0-1,num=int((self.end_INP0-self.start_INP0+1)/self.interval_INPO),dtype=int)
+            labelList = [
+                osp.splitext(img_p)[0] + ".json" for img_p in self.INTERPOLATION_list
+            ]
+            interpolatedList = self.imageList[self.start_INP0 - 1 : self.end_INP0]
+            interpolatedList = [
+                osp.splitext(img_p)[0] + ".json" for img_p in interpolatedList
+            ]
+            img_indices = np.linspace(
+                self.start_INP0 - 1,
+                self.end_INP0 - 1,
+                num=int((self.end_INP0 - self.start_INP0 + 1) / self.interval_INPO),
+                dtype=int,
+            )
 
             ref_bxoxes = []
             for jdx, json_path in enumerate(labelList):
                 with open(json_path) as file:
                     data = json.load(file)
 
-                
-                bboxes = [data['shapes'][i]['points'] for i in range(len(data['shapes']))]
-                labels = [data['shapes'][i]['label'] for i in range(len(data['shapes']))]
-                track_ids = [data['shapes'][i]['track_id'] for i in range(len(data['shapes']))]
+                bboxes = [
+                    data["shapes"][i]["points"] for i in range(len(data["shapes"]))
+                ]
+                labels = [
+                    data["shapes"][i]["label"] for i in range(len(data["shapes"]))
+                ]
+                track_ids = [
+                    data["shapes"][i]["track_id"] for i in range(len(data["shapes"]))
+                ]
                 # need boxes in x,y,w,h
                 bboxes_xyxy = [convert(bboxes[i]) for i in range(len(bboxes))]
-                picked_item = np.intersect1d(np.argwhere(np.array(track_ids)==self.ID_INPO),
-                                             np.argwhere(np.array(labels)==self.label_INPO))[0]
+                picked_item = np.intersect1d(
+                    np.argwhere(np.array(track_ids) == self.ID_INPO),
+                    np.argwhere(np.array(labels) == self.label_INPO),
+                )[0]
                 ref_bxoxes.append(bboxes_xyxy[picked_item])
 
             xyxy_bboxes = np.array(ref_bxoxes).astype(int)
@@ -1480,11 +1580,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
             interpolated_data = []
             for jdx in range(4):
-                kernel = RationalQuadratic() 
-                gpr = GaussianProcessRegressor(kernel=kernel,random_state=0).fit(img_indices.reshape(-1,1), xywh_bboxes[:,jdx])
-                interpolated_data.append(gpr.predict(np.arange(self.start_INP0-1,self.end_INP0).reshape(-1,1), return_std=False))
+                kernel = RationalQuadratic()
+                gpr = GaussianProcessRegressor(kernel=kernel, random_state=0).fit(
+                    img_indices.reshape(-1, 1), xywh_bboxes[:, jdx]
+                )
+                interpolated_data.append(
+                    gpr.predict(
+                        np.arange(self.start_INP0 - 1, self.end_INP0).reshape(-1, 1),
+                        return_std=False,
+                    )
+                )
 
-            interpolated_data = np.stack(interpolated_data,axis=1)
+            interpolated_data = np.stack(interpolated_data, axis=1)
             cvt_interpolated_data = cvt_xywh2xyxy(interpolated_data).astype(int)
 
             lf = LabelFile()
@@ -1496,19 +1603,28 @@ class MainWindow(QtWidgets.QMainWindow):
                     loaded_label = LabelFile(json_path)
                     loaded_shape = loaded_label.shapes
                     newshape = {
-                        'label':self.label_INPO,
-                        'points':[[int(cvt_interpolated_data[jdx][0]),int(cvt_interpolated_data[jdx][1])],[int(cvt_interpolated_data[jdx][2]),int(cvt_interpolated_data[jdx][3])]],
-                        'shape_type':'rectangle',
-                        'flags':{},
-                        'description':'',
-                        'group_id': None, 
-                        'track_id': self.ID_INPO, 
-                        'mask': None
+                        "label": self.label_INPO,
+                        "points": [
+                            [
+                                int(cvt_interpolated_data[jdx][0]),
+                                int(cvt_interpolated_data[jdx][1]),
+                            ],
+                            [
+                                int(cvt_interpolated_data[jdx][2]),
+                                int(cvt_interpolated_data[jdx][3]),
+                            ],
+                        ],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                        "description": "",
+                        "group_id": None,
+                        "track_id": self.ID_INPO,
+                        "mask": None,
                     }
                     loaded_shape.append(newshape)
-                    
+
                     imagePath = osp.splitext(json_path)[0] + ".jpg"
-                    # import ipdb; ipdb.set_trace()          
+                    # import ipdb; ipdb.set_trace()
                     lf.save(
                         filename=json_path,
                         shapes=loaded_shape,
@@ -1522,14 +1638,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     loaded_shape = []
                     newshape = {
-                        'label':self.label_INPO,
-                        'points':[[int(cvt_interpolated_data[jdx][0]),int(cvt_interpolated_data[jdx][1])],[int(cvt_interpolated_data[jdx][2]),int(cvt_interpolated_data[jdx][3])]],
-                        'shape_type':'rectangle',
-                        'flags':{},
-                        'description':'',
-                        'group_id': None, 
-                        'track_id': self.ID_INPO, 
-                        'mask': None
+                        "label": self.label_INPO,
+                        "points": [
+                            [
+                                int(cvt_interpolated_data[jdx][0]),
+                                int(cvt_interpolated_data[jdx][1]),
+                            ],
+                            [
+                                int(cvt_interpolated_data[jdx][2]),
+                                int(cvt_interpolated_data[jdx][3]),
+                            ],
+                        ],
+                        "shape_type": "rectangle",
+                        "flags": {},
+                        "description": "",
+                        "group_id": None,
+                        "track_id": self.ID_INPO,
+                        "mask": None,
                     }
                     loaded_shape.append(newshape)
                     imagePath = osp.splitext(json_path)[0] + ".jpg"
@@ -1543,15 +1668,17 @@ class MainWindow(QtWidgets.QMainWindow):
                         otherData={},
                         flags={},
                     )
-            
+
             filenames = self.scanAllImages(self.lastOpenDir)
-            
+
             for filename in filenames:
                 label_file = osp.splitext(filename)[0] + ".json"
                 label_index = self.imageList.index(filename)
                 item = self.fileListWidget.item(label_index)
-                if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
-                    item.setCheckState(Qt.Checked)            
+                if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
+                    label_file
+                ):
+                    item.setCheckState(Qt.Checked)
 
             # repaint the current frame
             self.mode = "NORMAL"
@@ -1559,24 +1686,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.filename = self.INTERPOLATION_filename
             # load the start file
             getIndex = self.imageList.index(self.INTERPOLATION_filename) + 1
-            self.navigation_list.statusBar.showMessage(f'Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}')
+            self.navigation_list.statusBar.showMessage(
+                f"Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}"
+            )
             self.loadFile(self.filename)
 
             self.informationMessage(
-                                "Box Interpolation",
-                                f"Track {self.label_INPO}-{self.ID_INPO} from frame {self.start_INP0} to {self.end_INP0} Interpolation is completed",
-                            )
-    
+                "Box Interpolation",
+                f"Track {self.label_INPO}-{self.ID_INPO} from frame {self.start_INP0} to {self.end_INP0} Interpolation is completed",
+            )
+
     def DELETION(self, item=None):
         dialog = DeletionDialog(
             parent=self,
         )
         dialog.exec_()
 
-        if (dialog.start_frame_cell.text() == '' or 
-            dialog.end_frame_cell.text() == '' or 
-            dialog.ID_cell.text() == '' or 
-            dialog.label_cell.text() == ''):
+        if (
+            dialog.start_frame_cell.text() == ""
+            or dialog.end_frame_cell.text() == ""
+            or dialog.ID_cell.text() == ""
+            or dialog.label_cell.text() == ""
+        ):
             return
 
         start_frame = int(dialog.start_frame_cell.text().replace(" ", ""))
@@ -1584,16 +1715,16 @@ class MainWindow(QtWidgets.QMainWindow):
         ID = dialog.ID_cell.text().replace(" ", "")
         label = dialog.label_cell.text().replace(" ", "")
 
-        if end_frame - start_frame <=0:
+        if end_frame - start_frame <= 0:
             self.errorMessage(
-                                "Track Deletion",
-                                "Start frame is higher than End frame.",
-                            )
-            
+                "Track Deletion",
+                "Start frame is higher than End frame.",
+            )
+
             return
-        
+
         labelList = [osp.splitext(img_p)[0] + ".json" for img_p in self.imageList]
-        deletionList = labelList[start_frame-1:end_frame]
+        deletionList = labelList[start_frame - 1 : end_frame]
 
         lf = LabelFile()
         # Edit frame Shape and save
@@ -1602,13 +1733,16 @@ class MainWindow(QtWidgets.QMainWindow):
             loaded_shape = loaded_label.shapes
             new_shape = []
             for kdx in range(len(loaded_shape)):
-                if loaded_shape[kdx]['label'] == label and loaded_shape[kdx]['track_id'] ==ID:
+                if (
+                    loaded_shape[kdx]["label"] == label
+                    and loaded_shape[kdx]["track_id"] == ID
+                ):
                     continue
                 else:
                     new_shape.append(loaded_shape[kdx])
-            
+
             imagePath = osp.splitext(json_path)[0] + ".jpg"
-                     
+
             lf.save(
                 filename=json_path,
                 shapes=new_shape,
@@ -1618,19 +1752,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 imageWidth=self.image.width(),
                 flags={},
             )
-        
-        
+
         self.filename = self.imageList[start_frame]
         # load the start file
         getIndex = self.imageList.index(self.filename) + 1
-        self.navigation_list.statusBar.showMessage(f'Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}')
+        self.navigation_list.statusBar.showMessage(
+            f"Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}"
+        )
         self.loadFile(self.filename)
 
         self.informationMessage(
-                                "Track Deletion",
-                                f"Track {label}-{ID} from frame {start_frame} to {end_frame} is deleted",
-                            )
-
+            "Track Deletion",
+            f"Track {label}-{ID} from frame {start_frame} to {end_frame} is deleted",
+        )
 
     def editID(self, item=None):
         if item and not isinstance(item, IDListWidgetItem):
@@ -1639,15 +1773,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.canvas.editing():
             return
         if not item:
-            _,item = self.currentItem()
+            _, item = self.currentItem()
         if item is None:
             return
         shape = item.shape()
         if shape is None:
             return
-        id = self.IDDialog.popUp(
-            text=shape.track_id
-        )
+        id = self.IDDialog.popUp(text=shape.track_id)
         if id is None:
             return
         if not self.validateLabel(id):
@@ -1663,7 +1795,7 @@ class MainWindow(QtWidgets.QMainWindow):
         item.setText(shape.track_id)
         self._update_shape_color(shape)
         self.setDirty()
-        unique_name = shape.label + '_' + str(shape.track_id)
+        unique_name = shape.label + "_" + str(shape.track_id)
         if self.uniqLabelList.findItemByLabel(unique_name) is None:
             item = self.uniqLabelList.createItemFromLabel(unique_name)
             self.uniqLabelList.addItem(item)
@@ -1676,7 +1808,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.canvas.editing():
             return
         if not item:
-            item,_ = self.currentItem()
+            item, _ = self.currentItem()
         if item is None:
             return
         shape = item.shape()
@@ -1713,7 +1845,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             item.setText("{} ({})".format(shape.label, shape.group_id))
         self.setDirty()
-        unique_name = shape.label + '_' + str(shape.track_id)
+        unique_name = shape.label + "_" + str(shape.track_id)
         if self.uniqLabelList.findItemByLabel(unique_name) is None:
             item = self.uniqLabelList.createItemFromLabel(unique_name)
             self.uniqLabelList.addItem(item)
@@ -1735,26 +1867,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not self.mayContinue():
             return
-        
+
         if self.mode == "None":
             self.mode = "NORMAL"
-        
+
         if self.mode == "TRACK INTERPOLATION":
             currIndex = self.imageList.index(str(item.text()))
             if currIndex < len(self.imageList):
                 filename = self.imageList[currIndex]
-            
+
             if filename in self.INTERPOLATION_list:
                 getIndex = self.imageList.index(filename) + 1
                 interpolationIndex = self.INTERPOLATION_list.index(self.filename) + 1
-                self.navigation_list.statusBar.showMessage(f'Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode} - ({interpolationIndex}/{len(self.INTERPOLATION_list)})')
+                self.navigation_list.statusBar.showMessage(
+                    f"Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode} - ({interpolationIndex}/{len(self.INTERPOLATION_list)})"
+                )
 
                 self.loadFile(filename)
             else:
                 self.errorMessage(
-                                "Box Interpolation",
-                                "You cannot select out-of-list frame. Use Previous (A) and Next (D) buttons to move between the selected frames",
-                            )
+                    "Box Interpolation",
+                    "You cannot select out-of-list frame. Use Previous (A) and Next (D) buttons to move between the selected frames",
+                )
                 return
 
         else:
@@ -1765,7 +1899,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.loadFile(filename)
 
             getIndex = self.imageList.index(self.filename) + 1
-            self.navigation_list.statusBar.showMessage(f'Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}')
+            self.navigation_list.statusBar.showMessage(
+                f"Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}"
+            )
 
     # React to canvas signals.
     def shapeSelectionChanged(self, selected_shapes):
@@ -1798,9 +1934,9 @@ class MainWindow(QtWidgets.QMainWindow):
             text = "{} ({})".format(shape.label, shape.group_id)
         label_list_item = LabelListWidgetItem(text, shape)
         self.labelList.addItem(label_list_item)
-        id_list_item = IDListWidgetItem(str(shape.track_id),shape)
+        id_list_item = IDListWidgetItem(str(shape.track_id), shape)
         self.IDList.addItem(id_list_item)
-        unique_name = shape.label + '_' + str(shape.track_id)
+        unique_name = shape.label + "_" + str(shape.track_id)
         if self.uniqLabelList.findItemByLabel(unique_name) is None:
             item = self.uniqLabelList.createItemFromLabel(unique_name)
             self.uniqLabelList.addItem(item)
@@ -1818,7 +1954,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _update_shape_color(self, shape):
-        unique_name = shape.label + '_' + str(shape.track_id)
+        unique_name = shape.label + "_" + str(shape.track_id)
         r, g, b = self._get_rgb_by_label(unique_name)
         shape.line_color = QtGui.QColor(r, g, b)
         shape.vertex_fill_color = QtGui.QColor(r, g, b)
@@ -1839,15 +1975,16 @@ class MainWindow(QtWidgets.QMainWindow):
             label_id += self._config["shift_auto_shape_color"]
             return LABEL_COLORMAP[label_id % len(LABEL_COLORMAP)]
         elif (
-            self._config["shape_color"] == "manual"
-            and self._config["label_colors"]
+            self._config["shape_color"] == "manual" and self._config["label_colors"]
             # and label in self._config["label_colors"]
         ):
             # return self._config["label_colors"][label]
-            if label.split('_')[-1] == 'None':
-                return [224, 224,   0]
+            if label.split("_")[-1] == "None":
+                return [224, 224, 0]
             else:
-                return self._config["label_colors"][int(label.split('_')[-1])][int(label.split('_')[-1])]
+                return self._config["label_colors"][int(label.split("_")[-1])][
+                    int(label.split("_")[-1])
+                ]
         elif self._config["default_shape_color"]:
             return self._config["default_shape_color"]
         return (0, 255, 0)
@@ -1880,16 +2017,32 @@ class MainWindow(QtWidgets.QMainWindow):
             if not points:
                 # skip point-empty shape
                 continue
-            
-            if self.ir_activated == True and label == self.ir_name and track_id == self.ir_id:
+
+            if (
+                self.ir_activated == True
+                and label == self.ir_name
+                and track_id == self.ir_id
+            ):
                 deltas = [
-                    [self.ir_mod_shape[0][0] - self.ir_old_shape[0][0], self.ir_mod_shape[0][1] - self.ir_old_shape[0][1]],
-                    [self.ir_mod_shape[1][0] - self.ir_old_shape[1][0], self.ir_mod_shape[1][1] - self.ir_old_shape[1][1]],
+                    [
+                        self.ir_mod_shape[0][0] - self.ir_old_shape[0][0],
+                        self.ir_mod_shape[0][1] - self.ir_old_shape[0][1],
+                    ],
+                    [
+                        self.ir_mod_shape[1][0] - self.ir_old_shape[1][0],
+                        self.ir_mod_shape[1][1] - self.ir_old_shape[1][1],
+                    ],
                 ]
-                
+
                 points = [
-                    [shape['points'][0][0] + deltas[0][0] ,shape['points'][0][1] + deltas[0][1]], 
-                    [shape['points'][1][0] + deltas[1][0] ,shape['points'][1][1] + deltas[1][1]]
+                    [
+                        shape["points"][0][0] + deltas[0][0],
+                        shape["points"][0][1] + deltas[0][1],
+                    ],
+                    [
+                        shape["points"][1][0] + deltas[1][0],
+                        shape["points"][1][1] + deltas[1][1],
+                    ],
                 ]
 
             shape = Shape(
@@ -1942,7 +2095,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
             return data
-        
+
         shapes = [format_shape(item.shape()) for item in self.labelList]
         flags = {}
         for i in range(self.flag_widget.count()):
@@ -2021,7 +2174,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def labelItemChanged(self, item):
         shape = item.shape()
         self.canvas.setShapeVisible(shape, item.checkState() == Qt.Checked)
-    
+
     def IDItemChanged(self, item):
         shape = item.shape()
         self.canvas.setShapeVisible(shape, item.checkState() == Qt.Checked)
@@ -2029,7 +2182,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def labelOrderChanged(self):
         self.setDirty()
         self.canvas.loadShapes([item.shape() for item in self.labelList])
-    
+
     def IDOrderChanged(self):
         self.setDirty()
         self.canvas.loadShapes([item.shape() for item in self.IDList])
@@ -2053,13 +2206,15 @@ class MainWindow(QtWidgets.QMainWindow):
             previous_text_label = self.labelDialog.edit.text()
             previous_text_id = self.IDDialog.edit.text()
             if self.mode == "NORMAL":
-                text_label, flags, group_id, description = self.labelDialog.popUp(text_label)
+                text_label, flags, group_id, description = self.labelDialog.popUp(
+                    text_label
+                )
                 text_id = self.IDDialog.popUp(text_id)
             else:
                 text_label = self.label_INPO
                 flags = {}
-                group_id = None 
-                description = ''
+                group_id = None
+                description = ""
                 text_id = self.ID_INPO
             if not text_label:
                 self.labelDialog.edit.setText(previous_text_label)
@@ -2082,10 +2237,10 @@ class MainWindow(QtWidgets.QMainWindow):
             shape.track_id = text_id
             shape.description = description
             self.addLabel(shape)
-            self.actions.editMode.setEnabled(True)
             self.actions.undoLastPoint.setEnabled(False)
             self.actions.undo.setEnabled(True)
             self.setDirty()
+            self.setEditMode()
         else:
             self.canvas.undoLastLine()
             self.canvas.shapesBackups.pop()
@@ -2192,10 +2347,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fileListWidget.setCurrentRow(self.imageList.index(filename))
             self.fileListWidget.repaint()
             return
-        
+
         self.resetState()
         self.canvas.setEnabled(False)
-        if filename is None:                                        # image file name .jpg
+        if filename is None:  # image file name .jpg
             filename = self.settings.value("filename", "")
         filename = str(filename)
         if not QtCore.QFile.exists(filename):
@@ -2206,26 +2361,32 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         # assumes same name, but json extension
         self.status(str(self.tr("Loading %s...")) % osp.basename(str(filename)))
-        
+
         label_file = osp.splitext(filename)[0] + ".json"
-        
+
+        if not os.path.isfile(label_file) and self.lastOpenDir:
+            alt = osp.join(self.lastOpenDir, osp.basename(label_file))
+            if os.path.isfile(alt):
+                label_file = alt
+
         if os.path.isfile(label_file):
             self.ir_old_shapes = []
             for item in LabelFile(label_file).shapes:
                 self.ir_old_shapes.append(item)
-        
+
         if self.output_dir:
             label_file_without_path = osp.basename(label_file)
             label_file = osp.join(self.output_dir, label_file_without_path)
-        if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):     # check if label_file exists and has correct type
+        if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
+            label_file
+        ):  # check if label_file exists and has correct type
             try:
-                self.labelFile = LabelFile(label_file)      # FIX LabelFile HERE
+                self.labelFile = LabelFile(label_file)  # FIX LabelFile HERE
             except LabelFileError as e:
                 self.errorMessage(
                     self.tr("Error opening file"),
                     self.tr(
-                        "<p><b>%s</b></p>"
-                        "<p>Make sure <i>%s</i> is a valid label file."
+                        "<p><b>%s</b></p><p>Make sure <i>%s</i> is a valid label file."
                     )
                     % (e, label_file),
                 )
@@ -2236,13 +2397,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 osp.dirname(label_file),
                 self.labelFile.imagePath,
             )
-            self.otherData = self.labelFile.otherData       # dont care
+            self.otherData = self.labelFile.otherData  # dont care
         else:
             self.imageData = LabelFile.load_image_file(filename)
             if self.imageData:
                 self.imagePath = filename
             self.labelFile = None
-        image = QtGui.QImage.fromData(self.imageData)   # load encoded image data
+        image = QtGui.QImage.fromData(self.imageData)  # load encoded image data
 
         if image.isNull():
             formats = [
@@ -2258,19 +2419,23 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.status(self.tr("Error reading %s") % filename)
             return False
-        self.image = image                                  # image data
+        self.image = image  # image data
         self.filename = filename
         if self._config["keep_prev"]:
             prev_shapes = self.canvas.shapes
         self.canvas.loadPixmap(QtGui.QPixmap.fromImage(image))
         flags = {k: False for k in self._config["flags"] or []}
-        if self.labelFile:                                  # if labelFile exists
-            self.loadLabels(self.labelFile.shapes)                  # FIX loadLabels HERE
+        if self.labelFile:  # if labelFile exists
+            self.loadLabels(self.labelFile.shapes)  # FIX loadLabels HERE
             if self.labelFile.flags is not None:
                 flags.update(self.labelFile.flags)
         self.loadFlags(flags)
-        if self._config["keep_prev"] and self.noShapes():       # check noShapes() /// Shapes are annotations
-            self.loadShapes(prev_shapes, replace=False)         # load annotation from prev image
+        if (
+            self._config["keep_prev"] and self.noShapes()
+        ):  # check noShapes() /// Shapes are annotations
+            self.loadShapes(
+                prev_shapes, replace=False
+            )  # load annotation from prev image
             self.setDirty()
         elif self.ir_activated == True:
             self.setDirty()
@@ -2424,7 +2589,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.loadFile(filename)
 
             self._config["keep_prev"] = keep_prev
-        else:            
+        else:
             currIndex = self.INTERPOLATION_list.index(self.filename)
             if currIndex - 1 >= 0:
                 filename = self.INTERPOLATION_list[currIndex - 1]
@@ -2447,17 +2612,26 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if self.mode == "NORMAL" or self.mode == "None":
-            if self.interpolationrefine_list.checkBox.isChecked() and self.ir_name != "None" and self.ir_id != "None":
+            if (
+                self.interpolationrefine_list.checkBox.isChecked()
+                and self.ir_name != "None"
+                and self.ir_id != "None"
+            ):
                 found = False
-                # original 
+                # original
                 for item in self.ir_old_shapes:
-                    if item['label'] == self.ir_name and item['track_id'] == self.ir_id:
-                        self.ir_old_shape = item['points']
+                    if item["label"] == self.ir_name and item["track_id"] == self.ir_id:
+                        self.ir_old_shape = item["points"]
                 # modified
                 for item in self.labelList:
-                    if item.shape().label == self.ir_name and item.shape().track_id == self.ir_id:
+                    if (
+                        item.shape().label == self.ir_name
+                        and item.shape().track_id == self.ir_id
+                    ):
                         found = True
-                        self.ir_mod_shape = [[p.x(), p.y()] for p in item.shape().points]
+                        self.ir_mod_shape = [
+                            [p.x(), p.y()] for p in item.shape().points
+                        ]
                 if found == False:
                     self.ir_old_shape = "None"
                     self.ir_mod_shape = "None"
@@ -2622,7 +2796,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def deleteFile(self):
         mb = QtWidgets.QMessageBox
         msg = self.tr(
-            "You are about to permanently delete this label file, " "proceed anyway?"
+            "You are about to permanently delete this label file, proceed anyway?"
         )
         answer = mb.warning(self, self.tr("Attention"), msg, mb.Yes | mb.No)
         if answer != mb.Yes:
@@ -2715,7 +2889,7 @@ class MainWindow(QtWidgets.QMainWindow):
         #     if self.noShapes():
         #         for action in self.actions.onShapesPresent:
         #             action.setEnabled(False)
-                    
+
         self.remLabels(self.canvas.deleteSelected())
         self.setDirty()
         if self.noShapes():
@@ -2750,7 +2924,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tr("%s - Open Directory") % __appname__,
                 defaultOpenDirPath,
                 QtWidgets.QFileDialog.ShowDirsOnly
-                | QtWidgets.QFileDialog.DontResolveSymlinks,
+                | QtWidgets.QFileDialog.DontResolveSymlinks
+                | QtWidgets.QFileDialog.DontUseNativeDialog,
             )
         )
         self.importDirImages(targetDirPath)
