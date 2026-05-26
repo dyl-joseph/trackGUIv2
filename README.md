@@ -22,7 +22,8 @@ TrackMe annotation format is compatible with LabelMe annotation format (.json) w
 - Display homogeneous color for same object info (for the sake of multi-view object tracking).
 - **Track ID rendered on canvas** next to each bounding box for quick visual identification.
 - **Backward-compatible with standard LabelMe annotations** — automatically uses `group_id` as `track_id` when `track_id` is missing from JSON files.
-- **Select All Frames** — Ctrl+A selects all frames in the file list. Shift+Click for range selection, Ctrl+Click for individual toggle.
+- **Track Forward (CSRT)** — Select a bounding box and press **T** to automatically propagate it across subsequent frames using OpenCV CSRT tracker.
+- **Track modification modes** — Remove Box, Swap ID, and Swap Label modes for bulk editing annotations across frame ranges.
 
 ## Changes from Original TrackGUI
 
@@ -38,19 +39,27 @@ TrackMe annotation format is compatible with LabelMe annotation format (.json) w
 
 5. **macOS file dialog freeze on cloud-synced directories** — The native macOS file picker would freeze/hang when opening directories on OneDrive or other cloud-synced paths. Switched to Qt's built-in file dialog (`QFileDialog.DontUseNativeDialog`) which handles these paths reliably (`labelme/app.py`).
 
+6. **Double dialog prompt when drawing rectangles** — The label and track ID dialogs each appeared twice when creating a new rectangle. Caused by the autocompleter's `activated` signal being connected to `popUp()`, which reopened the modal dialog. Fixed by connecting to `edit.setText()` instead (`labelme/widgets/label_dialog.py`, `labelme/widgets/id_dialog.py`).
+
+7. **Deletion dialog only deleted, never swapped** — The track modification dialog didn't expose its mode selection. Rewrote the dialog and the `DELETION` method to properly support all three modes: Remove Box, Swap ID, and Swap Label (`labelme/widgets/deletetrack_dialog.py`, `labelme/app.py`).
+
+8. **Save path resolution inconsistencies** — `saveFile()` and `setDirty()` used different logic to determine where to write JSON files, sometimes falling through to a save dialog or writing to the wrong directory. Consolidated into a single `_resolveJsonPath()` helper that prefers `lastOpenDir` (`labelme/app.py`).
+
+9. **Deletions not persisting** — `deleteSelectedShape()` called `setDirty()` but not `saveFile()`, so deleted shapes reappeared on reload. Added explicit save after deletion (`labelme/app.py`).
+
+10. **Crash on non-numeric track_id** — `_get_rgb_by_label()` called `int()` on track IDs like `"defect"`, causing a `ValueError`. Added try/except fallback (`labelme/app.py`).
+
 ### Enhancements
 
-6. **Track ID displayed on bounding boxes** — Each bounding box now renders its `track_id` (or `group_id` as fallback) in white text above the top-left corner of the shape on the canvas (`labelme/shape.py`). This makes it easy to visually identify which track each annotation belongs to without having to select it.
+11. **Track Forward (CSRT)** — Select a rectangle bounding box and press **T** (or Track > Track Forward) to propagate it across subsequent frames using OpenCV's CSRT tracker. The tracker writes annotations with the same label and track_id to each frame's JSON file, stopping automatically if tracking confidence drops (`labelme/app.py`).
 
-7. **Backward compatibility with standard LabelMe annotations** — When loading JSON files that have `group_id` but no `track_id` (i.e., annotations created with standard LabelMe rather than TrackGUI), the loader now automatically falls back to using `group_id` as the `track_id` (`labelme/label_file.py`). This means pre-existing LabelMe annotations work seamlessly in TrackGUI without manual conversion.
+12. **Track ID displayed on bounding boxes** — Each bounding box now renders its `track_id` (or `group_id` as fallback) in white text above the top-left corner of the shape on the canvas (`labelme/shape.py`). This makes it easy to visually identify which track each annotation belongs to without having to select it.
 
-### Code Quality
-
-8. **Select All Frames (Ctrl+A)** — Added a "Select All Frames" action (File menu, Ctrl+A) that selects all frames in the file list. The file list now uses extended selection mode, supporting Shift+Click for range selection and Ctrl+Click for toggling individual frames (`labelme/app.py`).
+13. **Backward compatibility with standard LabelMe annotations** — When loading JSON files that have `group_id` but no `track_id` (i.e., annotations created with standard LabelMe rather than TrackGUI), the loader now automatically falls back to using `group_id` as the `track_id` (`labelme/label_file.py`). This means pre-existing LabelMe annotations work seamlessly in TrackGUI without manual conversion.
 
 ### Code Quality
 
-9. **Ruff formatting applied** — The entire codebase has been reformatted with `ruff format` (line length 88, double quotes, 4-space indent, isort-sorted imports) for consistent code style (`labelme/app.py` and other files).
+14. **Ruff formatting applied** — The entire codebase has been reformatted with `ruff format` (line length 88, double quotes, 4-space indent, isort-sorted imports) for consistent code style (`labelme/app.py` and other files).
 
 ## Installation
 
@@ -107,13 +116,14 @@ labelme
 - **Shift+D** — Delete selected polygons
 - **Ctrl+Z** — Undo
 - **E** — Edit mode (select/move shapes)
-- **Ctrl+A** — Select all frames in the file list
+- **T** — Track Forward (propagate selected bbox across frames)
 
 ### Tracking modes
 
 - **Track from scratch**: Tracks from the first frame to the end frame with automatic ID assignment.
 - **Track from Current Frame w/ Annotation**: Tracks from the current frame using the modified or manually assigned ID.
 - **Track from Current Frame w/o Annotation**: Tracks from the current frame with automatic ID assignment.
+- **Track Forward (CSRT)**: Select a single rectangle, press **T**, enter the end frame. The OpenCV CSRT tracker propagates the bbox forward, writing annotations with the same label and track_id to each frame's JSON file. Stops automatically if tracking fails.
 
 ### Annotation format
 
