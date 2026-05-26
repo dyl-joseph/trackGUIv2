@@ -708,9 +708,18 @@ class MainWindow(QtWidgets.QMainWindow):
         call_track_forward = action(
             self.tr("&Track Forward (CSRT)"),
             self.trackForward,
-            "T",
+            "Ctrl+T",
             "edit",
             self.tr("Track selected bbox forward using OpenCV CSRT"),
+            enabled=False,
+        )
+
+        hideSelected = action(
+            self.tr("&Hide Selected"),
+            self.hideSelectedShape,
+            "H",
+            "eye",
+            self.tr("Hide the selected shape"),
             enabled=False,
         )
 
@@ -833,7 +842,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 editMode,
                 brightnessContrast,
             ),
-            onShapesPresent=(saveAs, hideAll, showAll, toggleAll),
+            onShapesPresent=(saveAs, hideAll, showAll, toggleAll, hideSelected),
         )
 
         self.canvas.vertexSelected.connect(self.actions.removePoint.setEnabled)
@@ -882,6 +891,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 hideAll,
                 showAll,
                 toggleAll,
+                hideSelected,
                 None,
                 zoomIn,
                 zoomOut,
@@ -2488,6 +2498,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if value is None:
                 flag = item.checkState() == Qt.Unchecked
             item.setCheckState(Qt.Checked if flag else Qt.Unchecked)
+
+    def hideSelectedShape(self):
+        for shape in self.canvas.selectedShapes:
+            for i in range(self.labelList.count()):
+                item = self.labelList.item(i)
+                if item.data(Qt.UserRole) is shape:
+                    item.setCheckState(Qt.Unchecked)
+                    break
 
     def loadFile(self, filename=None):
         """Load the specified file, or the last opened file if None."""

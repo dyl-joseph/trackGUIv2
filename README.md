@@ -116,7 +116,9 @@ labelme
 - **Shift+D** — Delete selected polygons
 - **Ctrl+Z** — Undo
 - **E** — Edit mode (select/move shapes)
-- **T** — Track Forward (propagate selected bbox across frames)
+- **H** — Hide selected shape
+- **T** — Toggle all polygons visibility
+- **Ctrl+T** — Track Forward (propagate selected bbox across frames)
 
 ### Tracking modes
 
