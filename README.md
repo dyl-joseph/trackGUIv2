@@ -99,7 +99,7 @@ labelme
 - **D** — Next image
 - **A** — Previous image
 - **Ctrl+S** — Save annotations
-- **Delete** — Delete selected polygons
+- **Shift+D** — Delete selected polygons
 - **Ctrl+Z** — Undo
 - **E** — Edit mode (select/move shapes)
 
