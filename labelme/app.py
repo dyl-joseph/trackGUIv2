@@ -211,6 +211,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fileSearch.setPlaceholderText(self.tr("Search Filename"))
         self.fileSearch.textChanged.connect(self.fileSearchChanged)
         self.fileListWidget = QtWidgets.QListWidget()
+        self.fileListWidget.setSelectionMode(
+            QtWidgets.QAbstractItemView.ExtendedSelection
+        )
         self.fileListWidget.itemSelectionChanged.connect(self.fileSelectionChanged)
         fileListLayout = QtWidgets.QVBoxLayout()
         fileListLayout.setContentsMargins(0, 0, 0, 0)
@@ -309,6 +312,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Open prev (hold Ctl+Shift to copy labels)"),
             enabled=False,
         )
+        selectAllFrames = action(
+            self.tr("Select &All Frames"),
+            self.selectAllFrames,
+            "Ctrl+A",
+            None,
+            self.tr("Select all frames in the file list"),
+        )
+
         save = action(
             self.tr("&Save\n"),
             self.saveFile,
@@ -845,6 +856,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 openNextImg,
                 openPrevImg,
                 opendir,
+                selectAllFrames,
                 self.menus.recentFiles,
                 save,
                 saveAs,
@@ -1858,6 +1870,11 @@ class MainWindow(QtWidgets.QMainWindow):
             pattern=self.fileSearch.text(),
             load=False,
         )
+
+    def selectAllFrames(self):
+        self.fileListWidget.blockSignals(True)
+        self.fileListWidget.selectAll()
+        self.fileListWidget.blockSignals(False)
 
     def fileSelectionChanged(self):
         items = self.fileListWidget.selectedItems()

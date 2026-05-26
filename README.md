@@ -22,6 +22,7 @@ TrackMe annotation format is compatible with LabelMe annotation format (.json) w
 - Display homogeneous color for same object info (for the sake of multi-view object tracking).
 - **Track ID rendered on canvas** next to each bounding box for quick visual identification.
 - **Backward-compatible with standard LabelMe annotations** — automatically uses `group_id` as `track_id` when `track_id` is missing from JSON files.
+- **Select All Frames** — Ctrl+A selects all frames in the file list. Shift+Click for range selection, Ctrl+Click for individual toggle.
 
 ## Changes from Original TrackGUI
 
@@ -45,7 +46,11 @@ TrackMe annotation format is compatible with LabelMe annotation format (.json) w
 
 ### Code Quality
 
-8. **Ruff formatting applied** — The entire codebase has been reformatted with `ruff format` (line length 88, double quotes, 4-space indent, isort-sorted imports) for consistent code style (`labelme/app.py` and other files).
+8. **Select All Frames (Ctrl+A)** — Added a "Select All Frames" action (File menu, Ctrl+A) that selects all frames in the file list. The file list now uses extended selection mode, supporting Shift+Click for range selection and Ctrl+Click for toggling individual frames (`labelme/app.py`).
+
+### Code Quality
+
+9. **Ruff formatting applied** — The entire codebase has been reformatted with `ruff format` (line length 88, double quotes, 4-space indent, isort-sorted imports) for consistent code style (`labelme/app.py` and other files).
 
 ## Installation
 
@@ -102,6 +107,7 @@ labelme
 - **Shift+D** — Delete selected polygons
 - **Ctrl+Z** — Undo
 - **E** — Edit mode (select/move shapes)
+- **Ctrl+A** — Select all frames in the file list
 
 ### Tracking modes
 
