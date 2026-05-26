@@ -121,7 +121,7 @@ Annotations are saved as `.json` files (one per image) in LabelMe format. Each s
 ## Note
 All frames must have labeled boxes for interpolation and tracking features to work correctly.
 
-## Citation
+## Original Paper Citation
 If you find our work helpful, please consider citing our paper:
 ```
 @article{phan2024trackme,
