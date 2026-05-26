@@ -123,7 +123,7 @@ class LabelDialog(QtWidgets.QDialog):
         # completer.setModel(self.labelList.model())
         # self.edit.setCompleter(completer)
         completer = QtWidgets.QCompleter(self.labelList.model(), self)
-        completer.activated.connect(self.popUp)
+        completer.activated.connect(self.edit.setText)
         self.edit.setCompleter(completer)
 
     def addLabelHistory(self, label):
@@ -175,7 +175,7 @@ class LabelDialog(QtWidgets.QDialog):
 
     def resetFlags(self, label=""):
         flags = {}
-        
+
         for pattern, keys in self._flags.items():
             if re.match(pattern, label):
                 for key in keys:

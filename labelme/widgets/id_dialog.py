@@ -1,4 +1,3 @@
-import re
 
 from qtpy import QT_VERSION
 from qtpy import QtCore
@@ -35,7 +34,7 @@ class IDDialog(QtWidgets.QDialog):
         sort_ids=True,
         show_text_field=True,
         completion="startswith",
-        fit_to_content=None
+        fit_to_content=None,
     ):
         if fit_to_content is None:
             fit_to_content = {"row": False, "column": True}
@@ -107,11 +106,11 @@ class IDDialog(QtWidgets.QDialog):
         #     raise ValueError("Unsupported completion: {}".format(completion))
         # completer.setModel(self.IDList.model())
         completer = QtWidgets.QCompleter(self.IDList.model(), self)
-        completer.activated.connect(self.popUp)
+        completer.activated.connect(self.edit.setText)
         self.edit.setCompleter(completer)
 
     def addIDHistory(self, id):
-        if self.IDList.findItems(id,QtCore.Qt.MatchExactly):
+        if self.IDList.findItems(id, QtCore.Qt.MatchExactly):
             return
         self.IDList.addItem(id)
         if self._sort_labels:
@@ -129,7 +128,7 @@ class IDDialog(QtWidgets.QDialog):
         if text:
             self.accept()
 
-    def IDDoubleClicked(self,item):
+    def IDDoubleClicked(self, item):
         self.validate()
 
     def postProcess(self):
@@ -160,13 +159,11 @@ class IDDialog(QtWidgets.QDialog):
             self.IDList.setCurrentItem(items[0])
             row = self.IDList.row(items[0])
             self.edit.completer().setCurrentRow(row)
-        
+
         self.edit.setFocus(QtCore.Qt.PopupFocusReason)
         if move:
             self.move(QtGui.QCursor.pos())
         if self.exec_():
-            return (
-                self.edit.text()
-            )
+            return self.edit.text()
         else:
             return None

@@ -9,6 +9,7 @@ import os.path as osp
 import re
 import webbrowser
 
+import cv2  # noqa: F401
 import imgviz
 import natsort
 import numpy as np
@@ -211,9 +212,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fileSearch.setPlaceholderText(self.tr("Search Filename"))
         self.fileSearch.textChanged.connect(self.fileSearchChanged)
         self.fileListWidget = QtWidgets.QListWidget()
-        self.fileListWidget.setSelectionMode(
-            QtWidgets.QAbstractItemView.ExtendedSelection
-        )
         self.fileListWidget.itemSelectionChanged.connect(self.fileSelectionChanged)
         fileListLayout = QtWidgets.QVBoxLayout()
         fileListLayout.setContentsMargins(0, 0, 0, 0)
@@ -312,14 +310,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Open prev (hold Ctl+Shift to copy labels)"),
             enabled=False,
         )
-        selectAllFrames = action(
-            self.tr("Select &All Frames"),
-            self.selectAllFrames,
-            "Ctrl+A",
-            None,
-            self.tr("Select all frames in the file list"),
-        )
-
         save = action(
             self.tr("&Save\n"),
             self.saveFile,
@@ -715,6 +705,15 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled=False,
         )
 
+        call_track_forward = action(
+            self.tr("&Track Forward (CSRT)"),
+            self.trackForward,
+            "T",
+            "edit",
+            self.tr("Track selected bbox forward using OpenCV CSRT"),
+            enabled=False,
+        )
+
         fill_drawing = action(
             self.tr("Fill Drawing Polygon"),
             self.canvas.setFillDrawing,
@@ -755,6 +754,7 @@ class MainWindow(QtWidgets.QMainWindow):
             SORT=call_sort,
             INPO=call_interpolation,
             DELE=call_deletion,
+            trackForward=call_track_forward,
             duplicate=duplicate,
             copy=copy,
             paste=paste,
@@ -856,7 +856,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 openNextImg,
                 openPrevImg,
                 opendir,
-                selectAllFrames,
                 self.menus.recentFiles,
                 save,
                 saveAs,
@@ -897,7 +896,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         utils.addActions(
             self.menus.track,
-            (call_interpolation, call_sort, call_deletion),
+            (call_interpolation, call_sort, call_deletion, call_track_forward),
         )
 
         self.menus.file.aboutToShow.connect(self.updateFileMenu)
@@ -1072,18 +1071,20 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         utils.addActions(self.menus.edit, actions + self.actions.editMenu)
 
+    def _resolveJsonPath(self):
+        if self.labelFile and self.labelFile.filename:
+            return self.labelFile.filename
+        label_file = osp.splitext(self.filename)[0] + ".json"
+        if self.output_dir:
+            return osp.join(self.output_dir, osp.basename(label_file))
+        if self.lastOpenDir:
+            return osp.join(self.lastOpenDir, osp.basename(label_file))
+        return label_file
+
     def setDirty(self):
-        # Even if we autosave the file, we keep the ability to undo
         self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
         if self._config["auto_save"] or self.actions.saveAuto.isChecked():
-            if self.imagePath == self.filename:
-                label_file = osp.splitext(self.imagePath)[0] + ".json"
-            else:
-                label_file = osp.splitext(self.filename)[0] + ".json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
-            self.saveLabels(label_file)
+            self.saveLabels(self._resolveJsonPath())
             return
         self.dirty = True
         self.actions.save.setEnabled(True)
@@ -1106,6 +1107,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.SORT.setEnabled(True)
         self.actions.INPO.setEnabled(True)
         self.actions.DELE.setEnabled(True)
+        self.actions.trackForward.setEnabled(True)
         title = __appname__
         if self.filename is not None:
             title = "{} - {}".format(title, self.filename)
@@ -1735,25 +1737,39 @@ class MainWindow(QtWidgets.QMainWindow):
 
             return
 
-        labelList = [osp.splitext(img_p)[0] + ".json" for img_p in self.imageList]
-        deletionList = labelList[start_frame - 1 : end_frame]
+        mode = dialog.mode
+        new_ID = dialog.new_ID_cell.text().replace(" ", "")
+        new_label = dialog.new_label_cell.text().replace(" ", "")
+
+        imageSlice = self.imageList[start_frame - 1 : end_frame]
 
         lf = LabelFile()
-        # Edit frame Shape and save
-        for jdx, json_path in enumerate(deletionList):
+        for img_path in imageSlice:
+            basename = osp.splitext(osp.basename(img_path))[0] + ".json"
+            json_path = osp.splitext(img_path)[0] + ".json"
+            if self.lastOpenDir:
+                alt = osp.join(self.lastOpenDir, basename)
+                if os.path.isfile(alt):
+                    json_path = alt
+            if not os.path.isfile(json_path):
+                continue
+
             loaded_label = LabelFile(json_path)
             loaded_shape = loaded_label.shapes
             new_shape = []
-            for kdx in range(len(loaded_shape)):
-                if (
-                    loaded_shape[kdx]["label"] == label
-                    and loaded_shape[kdx]["track_id"] == ID
-                ):
+            for s in loaded_shape:
+                tid = s.get("track_id") or s.get("group_id")
+                match = s["label"] == label and str(tid) == str(ID)
+                if match and mode == "Remove Box":
                     continue
-                else:
-                    new_shape.append(loaded_shape[kdx])
+                if match and mode == "Swap ID" and new_ID:
+                    s["track_id"] = new_ID
+                    s["group_id"] = int(new_ID) if new_ID.isdigit() else new_ID
+                if match and mode == "Swap Label" and new_label:
+                    s["label"] = new_label
+                new_shape.append(s)
 
-            imagePath = osp.splitext(json_path)[0] + ".jpg"
+            imagePath = loaded_label.imagePath or osp.basename(img_path)
 
             lf.save(
                 filename=json_path,
@@ -1766,16 +1782,137 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         self.filename = self.imageList[start_frame]
-        # load the start file
         getIndex = self.imageList.index(self.filename) + 1
         self.navigation_list.statusBar.showMessage(
             f"Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}"
         )
         self.loadFile(self.filename)
 
+        if mode == "Remove Box":
+            msg = (
+                f"Track {label}-{ID} from frame {start_frame} to {end_frame} is deleted"
+            )
+        elif mode == "Swap ID":
+            msg = f"Track {label}-{ID} swapped to ID {new_ID} from frame {start_frame} to {end_frame}"
+        elif mode == "Swap Label":
+            msg = f"Track {label}-{ID} swapped to label {new_label} from frame {start_frame} to {end_frame}"
+        self.informationMessage("Track Modification", msg)
+
+    def trackForward(self):
+        if len(self.canvas.selectedShapes) != 1:
+            self.errorMessage(
+                "Track Forward",
+                "Select exactly one rectangle to track.",
+            )
+            return
+        shape = self.canvas.selectedShapes[0]
+        if shape.shape_type != "rectangle" or len(shape.points) != 2:
+            self.errorMessage(
+                "Track Forward",
+                "Only rectangle bounding boxes can be tracked.",
+            )
+            return
+
+        curr_index = self.imageList.index(self.filename)
+        total_frames = len(self.imageList)
+
+        end_frame, ok = QtWidgets.QInputDialog.getInt(
+            self,
+            "Track Forward",
+            f"Track to frame (current: {curr_index + 1}, total: {total_frames}):",
+            total_frames,
+            curr_index + 2,
+            total_frames,
+        )
+        if not ok:
+            return
+
+        label = shape.label
+        track_id = shape.track_id
+        group_id = shape.group_id
+        p1, p2 = shape.points[0], shape.points[1]
+        x = int(min(p1.x(), p2.x()))
+        y = int(min(p1.y(), p2.y()))
+        w = int(abs(p2.x() - p1.x()))
+        h = int(abs(p2.y() - p1.y()))
+
+        curr_img = cv2.imread(self.imageList[curr_index])
+        if curr_img is None:
+            self.errorMessage("Track Forward", "Cannot read current frame image.")
+            return
+
+        tracker = cv2.TrackerCSRT.create()
+        tracker.init(curr_img, (x, y, w, h))
+
+        lf = LabelFile()
+        last_tracked = curr_index
+        for i in range(curr_index + 1, end_frame):
+            img_path = self.imageList[i]
+            frame = cv2.imread(img_path)
+            if frame is None:
+                break
+
+            success, bbox = tracker.update(frame)
+            if not success:
+                break
+
+            bx, by, bw, bh = [int(v) for v in bbox]
+            new_points = [[bx, by], [bx + bw, by + bh]]
+
+            basename = osp.splitext(osp.basename(img_path))[0] + ".json"
+            json_path = osp.splitext(img_path)[0] + ".json"
+            if self.lastOpenDir:
+                alt = osp.join(self.lastOpenDir, basename)
+                if os.path.isfile(alt):
+                    json_path = alt
+
+            if os.path.isfile(json_path):
+                loaded = LabelFile(json_path)
+                shapes = loaded.shapes
+                img_rel = loaded.imagePath
+            else:
+                shapes = []
+                img_rel = osp.basename(img_path)
+
+            updated = False
+            tid_str = str(track_id) if track_id is not None else None
+            for s in shapes:
+                s_tid = str(s.get("track_id") or s.get("group_id"))
+                if s["label"] == label and s_tid == tid_str:
+                    s["points"] = new_points
+                    updated = True
+                    break
+            if not updated:
+                shapes.append(
+                    dict(
+                        label=label,
+                        points=new_points,
+                        group_id=group_id,
+                        track_id=track_id,
+                        shape_type="rectangle",
+                        flags={},
+                        description="",
+                        mask=None,
+                    )
+                )
+
+            lf.save(
+                filename=json_path,
+                shapes=shapes,
+                imagePath=img_rel,
+                imageData=None,
+                imageHeight=curr_img.shape[0],
+                imageWidth=curr_img.shape[1],
+                flags={},
+            )
+            last_tracked = i
+
+        tracked_count = last_tracked - curr_index
+        self.loadFile(self.filename)
         self.informationMessage(
-            "Track Deletion",
-            f"Track {label}-{ID} from frame {start_frame} to {end_frame} is deleted",
+            "Track Forward",
+            f"Tracked {label}-{track_id} forward {tracked_count} frames "
+            f"(frame {curr_index + 1} to {last_tracked + 1}).",
         )
 
     def editID(self, item=None):
@@ -1870,11 +2007,6 @@ class MainWindow(QtWidgets.QMainWindow):
             pattern=self.fileSearch.text(),
             load=False,
         )
-
-    def selectAllFrames(self):
-        self.fileListWidget.blockSignals(True)
-        self.fileListWidget.selectAll()
-        self.fileListWidget.blockSignals(False)
 
     def fileSelectionChanged(self):
         items = self.fileListWidget.selectedItems()
@@ -1996,12 +2128,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # and label in self._config["label_colors"]
         ):
             # return self._config["label_colors"][label]
-            if label.split("_")[-1] == "None":
+            suffix = label.split("_")[-1]
+            if suffix == "None":
                 return [224, 224, 0]
-            else:
-                return self._config["label_colors"][int(label.split("_")[-1])][
-                    int(label.split("_")[-1])
-                ]
+            try:
+                idx = int(suffix)
+                return self._config["label_colors"][idx][idx]
+            except (ValueError, IndexError, KeyError):
+                return (0, 255, 0)
         elif self._config["default_shape_color"]:
             return self._config["default_shape_color"]
         return (0, 255, 0)
@@ -2381,7 +2515,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         label_file = osp.splitext(filename)[0] + ".json"
 
-        if not os.path.isfile(label_file) and self.lastOpenDir:
+        if self.lastOpenDir:
             alt = osp.join(self.lastOpenDir, osp.basename(label_file))
             if os.path.isfile(alt):
                 label_file = alt
@@ -2745,14 +2879,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def saveFile(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
-        if self.labelFile:
-            # DL20180323 - overwrite when in directory
-            self._saveFile(self.labelFile.filename)
-        elif self.output_file:
+        if self.output_file:
             self._saveFile(self.output_file)
             self.close()
         else:
-            self._saveFile(self.saveFileDialog())
+            self._saveFile(self._resolveJsonPath())
 
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
@@ -2909,6 +3040,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.remLabels(self.canvas.deleteSelected())
         self.setDirty()
+        self.saveFile()
         if self.noShapes():
             for action in self.actions.onShapesPresent:
                 action.setEnabled(False)
@@ -2970,7 +3102,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 label_file_without_path = osp.basename(label_file)
                 label_file = osp.join(self.output_dir, label_file_without_path)
             item = QtWidgets.QListWidgetItem(file)
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item.setFlags(
+                Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+            )
             if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
                 item.setCheckState(Qt.Checked)
             else:
@@ -3006,7 +3140,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 label_file_without_path = osp.basename(label_file)
                 label_file = osp.join(self.output_dir, label_file_without_path)
             item = QtWidgets.QListWidgetItem(filename)
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item.setFlags(
+                Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+            )
             if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
                 item.setCheckState(Qt.Checked)
             else:

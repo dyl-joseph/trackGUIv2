@@ -50,6 +50,7 @@ dependencies:
       - networkx==3.2.1
       - numpy==2.0.2
       - onnxruntime==1.19.2
+      - opencv-contrib-python==4.13.0.92
       - opencv-python==4.13.0.92
       - packaging==26.2
       - pillow==11.3.0
