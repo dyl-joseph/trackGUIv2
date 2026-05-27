@@ -2567,12 +2567,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.labelFile.imagePath,
             )
             self.otherData = self.labelFile.otherData  # dont care
+            if self.imageData is None:
+                self.imageData = LabelFile.load_image_file(filename)
         else:
             self.imageData = LabelFile.load_image_file(filename)
             if self.imageData:
                 self.imagePath = filename
             self.labelFile = None
-        image = QtGui.QImage.fromData(self.imageData)  # load encoded image data
+        if self.imageData is None:
+            self.errorMessage(
+                self.tr("Error opening file"),
+                self.tr("Cannot read image: %s") % filename,
+            )
+            self.status(self.tr("Error reading %s") % filename)
+            return False
+        image = QtGui.QImage.fromData(self.imageData)
 
         if image.isNull():
             formats = [

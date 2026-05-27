@@ -93,20 +93,23 @@ class LabelFile(object):
                 if PY2 and QT4:
                     imageData = utils.img_data_to_png_data(imageData)
             else:
+                imageData = None
                 # relative path from label file to relative path from cwd
                 imagePath = osp.join(osp.dirname(filename), data["imagePath"])
                 if osp.isfile(imagePath):
                     imageData = self.load_image_file(imagePath)
-                else:
-                    imagePath = filename.split('.json')[0] + '.jpg'
-                    imageData = self.load_image_file(imagePath)
+                if imageData is None:
+                    imagePath = filename.split(".json")[0] + ".jpg"
+                    if osp.isfile(imagePath):
+                        imageData = self.load_image_file(imagePath)
             flags = data.get("flags") or {}
             imagePath = data["imagePath"]
-            self._check_image_height_and_width(
-                base64.b64encode(imageData).decode("utf-8"),
-                data.get("imageHeight"),
-                data.get("imageWidth"),
-            )
+            if imageData is not None:
+                self._check_image_height_and_width(
+                    base64.b64encode(imageData).decode("utf-8"),
+                    data.get("imageHeight"),
+                    data.get("imageWidth"),
+                )
             shapes = [
                 dict(
                     label=s["label"],
