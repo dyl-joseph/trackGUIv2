@@ -2501,9 +2501,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def hideSelectedShape(self):
         for shape in self.canvas.selectedShapes:
-            for i in range(self.labelList.count()):
-                item = self.labelList.item(i)
-                if item.data(Qt.UserRole) is shape:
+            for item in self.labelList:
+                if item.shape() is shape:
                     item.setCheckState(Qt.Unchecked)
                     break
 
