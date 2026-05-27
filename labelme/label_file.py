@@ -14,6 +14,7 @@ from labelme.logger import logger
 
 PIL.Image.MAX_IMAGE_PIXELS = None
 
+
 @contextlib.contextmanager
 def open(name, mode):
     assert mode in ["r", "w"]
@@ -94,14 +95,24 @@ class LabelFile(object):
                     imageData = utils.img_data_to_png_data(imageData)
             else:
                 imageData = None
-                # relative path from label file to relative path from cwd
-                imagePath = osp.join(osp.dirname(filename), data["imagePath"])
-                if osp.isfile(imagePath):
-                    imageData = self.load_image_file(imagePath)
-                if imageData is None:
-                    imagePath = filename.split(".json")[0] + ".jpg"
-                    if osp.isfile(imagePath):
-                        imageData = self.load_image_file(imagePath)
+                json_dir = osp.dirname(filename)
+                img_name = data["imagePath"]
+                candidates = [
+                    osp.join(json_dir, img_name),
+                    filename.split(".json")[0] + ".jpg",
+                ]
+                # labelme_videoXXXX → videoXXXX sibling directory
+                dir_base = osp.basename(json_dir)
+                if dir_base.startswith("labelme_"):
+                    sibling = osp.join(
+                        osp.dirname(json_dir), dir_base[len("labelme_") :], img_name
+                    )
+                    candidates.append(sibling)
+                for candidate in candidates:
+                    if osp.isfile(candidate):
+                        imageData = self.load_image_file(candidate)
+                        if imageData is not None:
+                            break
             flags = data.get("flags") or {}
             imagePath = data["imagePath"]
             if imageData is not None:
