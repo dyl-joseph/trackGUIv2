@@ -101,13 +101,15 @@ class LabelFile(object):
                     osp.join(json_dir, img_name),
                     filename.split(".json")[0] + ".jpg",
                 ]
-                # labelme_videoXXXX → videoXXXX sibling directory
                 dir_base = osp.basename(json_dir)
                 if dir_base.startswith("labelme_"):
-                    sibling = osp.join(
-                        osp.dirname(json_dir), dir_base[len("labelme_") :], img_name
+                    stripped = dir_base[len("labelme_") :]
+                    # labelme_videoXXXX/videoXXXX/ subdirectory
+                    candidates.append(osp.join(json_dir, stripped, img_name))
+                    # videoXXXX/ sibling directory
+                    candidates.append(
+                        osp.join(osp.dirname(json_dir), stripped, img_name)
                     )
-                    candidates.append(sibling)
                 for candidate in candidates:
                     if osp.isfile(candidate):
                         imageData = self.load_image_file(candidate)
