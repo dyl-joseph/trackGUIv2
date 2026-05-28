@@ -1981,11 +1981,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         curr_index = self.imageList.index(self.filename)
-        end_frame = self._getTrackEndFrame(
-            "Track Forward (BoTSORT)", curr_index, len(self.imageList)
+        total_frames = len(self.imageList)
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Track Forward (BoTSORT)")
+        layout = QtWidgets.QFormLayout(dialog)
+        end_spin = QtWidgets.QSpinBox()
+        end_spin.setRange(curr_index + 2, total_frames)
+        end_spin.setValue(total_frames)
+        layout.addRow("Track to frame:", end_spin)
+        refine_check = QtWidgets.QCheckBox("Refine with EfficientSAM")
+        layout.addRow(refine_check)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
-        if end_frame is None:
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
+
+        end_frame = end_spin.value()
+        use_refine = refine_check.isChecked()
 
         label = shape.label
         track_id = shape.track_id
@@ -2011,6 +2028,14 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.processEvents()
 
         tracker = BoTSORTForwardTracker(model_name="yolo26x.pt")
+
+        ai_model = None
+        if use_refine:
+            progress.setLabelText("Loading EfficientSAM...")
+            QtWidgets.QApplication.processEvents()
+            self.canvas.initializeAiModel("EfficientSam (speed)")
+            ai_model = self.canvas._ai_model
+
         progress.setLabelText("Running YOLO + BoTSORT tracking...")
 
         if not tracker.init(curr_img, [x1, y1, x2, y2]):
@@ -2035,12 +2060,28 @@ class MainWindow(QtWidgets.QMainWindow):
             success, xyxy = tracker.update(frame)
             if not success:
                 break
+
+            bx1, by1, bx2, by2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
+
+            if ai_model is not None:
+                rgb_frame = frame[:, :, ::-1]
+                ai_model.set_image(rgb_frame)
+                mask = ai_model.predict_mask_from_box([bx1, by1, bx2, by2])
+                if mask is not None and mask.any():
+                    ys, xs = np.where(mask)
+                    bx1, by1, bx2, by2 = (
+                        int(xs.min()),
+                        int(ys.min()),
+                        int(xs.max()),
+                        int(ys.max()),
+                    )
+
             self._saveTrackResult(
                 self.imageList[i],
                 label,
                 track_id,
                 group_id,
-                [[int(xyxy[0]), int(xyxy[1])], [int(xyxy[2]), int(xyxy[3])]],
+                [[bx1, by1], [bx2, by2]],
                 curr_img.shape,
             )
             last_tracked = i
