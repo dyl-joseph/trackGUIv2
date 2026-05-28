@@ -2093,6 +2093,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         progress.close()
         tracker.reset()
+        if ai_model is not None:
+            self.canvas._ai_model = None
         tracked_count = last_tracked - curr_index
         self.loadFile(self.filename)
         self.informationMessage(
@@ -2132,6 +2134,7 @@ class MainWindow(QtWidgets.QMainWindow):
             shape.points[0] = QtCore.QPointF(float(xs.min()), float(ys.min()))
             shape.points[1] = QtCore.QPointF(float(xs.max()), float(ys.max()))
 
+        self.canvas._ai_model = None
         self.canvas.update()
         self.setDirty()
 
