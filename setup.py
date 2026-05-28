@@ -22,20 +22,21 @@ def get_version():
 def get_install_requires():
     install_requires = [
         "gdown",
-        #"imgviz>=1.7.5",
-        #"matplotlib",
-        #"natsort>=7.1.0",
+        # "imgviz>=1.7.5",
+        # "matplotlib",
+        # "natsort>=7.1.0",
         "numpy",
         "onnxruntime>=1.14.1,!=1.16.0",
-        #"Pillow>=2.8",
+        # "Pillow>=2.8",
         "PyYAML",
         "qtpy!=1.11.2",
-        #"scikit-image",
+        # "scikit-image",
         "termcolor",
         "filterpy",
-        #"opencv-python==4.1.2.30",
+        # "opencv-python==4.1.2.30",
         "scipy",
-        "scikit-learn"
+        "scikit-learn",
+        "ultralytics>=8.3.0",
     ]
 
     # Find python binding for qt with priority:

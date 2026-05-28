@@ -714,6 +714,15 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled=False,
         )
 
+        call_track_forward_botsort = action(
+            self.tr("&Track Forward (BoTSORT)"),
+            self.trackForwardBoTSORT,
+            "Ctrl+Shift+T",
+            "edit",
+            self.tr("Track selected bbox forward using YOLO + BoTSORT"),
+            enabled=False,
+        )
+
         hideSelected = action(
             self.tr("&Hide Selected"),
             self.hideSelectedShape,
@@ -764,6 +773,7 @@ class MainWindow(QtWidgets.QMainWindow):
             INPO=call_interpolation,
             DELE=call_deletion,
             trackForward=call_track_forward,
+            trackForwardBoTSORT=call_track_forward_botsort,
             duplicate=duplicate,
             copy=copy,
             paste=paste,
@@ -906,7 +916,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         utils.addActions(
             self.menus.track,
-            (call_interpolation, call_sort, call_deletion, call_track_forward),
+            (
+                call_interpolation,
+                call_sort,
+                call_deletion,
+                call_track_forward,
+                call_track_forward_botsort,
+            ),
         )
 
         self.menus.file.aboutToShow.connect(self.updateFileMenu)
@@ -1118,6 +1134,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.INPO.setEnabled(True)
         self.actions.DELE.setEnabled(True)
         self.actions.trackForward.setEnabled(True)
+        self.actions.trackForwardBoTSORT.setEnabled(True)
         title = __appname__
         if self.filename is not None:
             title = "{} - {}".format(title, self.filename)
@@ -1808,33 +1825,89 @@ class MainWindow(QtWidgets.QMainWindow):
             msg = f"Track {label}-{ID} swapped to label {new_label} from frame {start_frame} to {end_frame}"
         self.informationMessage("Track Modification", msg)
 
-    def trackForward(self):
-        if len(self.canvas.selectedShapes) != 1:
-            self.errorMessage(
-                "Track Forward",
-                "Select exactly one rectangle to track.",
+    def _saveTrackResult(
+        self, img_path, label, track_id, group_id, new_points, img_shape
+    ):
+        basename = osp.splitext(osp.basename(img_path))[0] + ".json"
+        json_path = osp.splitext(img_path)[0] + ".json"
+        if self.lastOpenDir:
+            alt = osp.join(self.lastOpenDir, basename)
+            if os.path.isfile(alt):
+                json_path = alt
+
+        if os.path.isfile(json_path):
+            loaded = LabelFile(json_path)
+            shapes = loaded.shapes
+            img_rel = loaded.imagePath
+        else:
+            shapes = []
+            img_rel = osp.basename(img_path)
+
+        updated = False
+        tid_str = str(track_id) if track_id is not None else None
+        for s in shapes:
+            s_tid = str(s.get("track_id") or s.get("group_id"))
+            if s["label"] == label and s_tid == tid_str:
+                s["points"] = new_points
+                updated = True
+                break
+        if not updated:
+            shapes.append(
+                dict(
+                    label=label,
+                    points=new_points,
+                    group_id=group_id,
+                    track_id=track_id,
+                    shape_type="rectangle",
+                    flags={},
+                    description="",
+                    mask=None,
+                )
             )
-            return
+
+        LabelFile().save(
+            filename=json_path,
+            shapes=shapes,
+            imagePath=img_rel,
+            imageData=None,
+            imageHeight=img_shape[0],
+            imageWidth=img_shape[1],
+            flags={},
+        )
+
+    def _getSelectedRect(self, title):
+        if len(self.canvas.selectedShapes) != 1:
+            self.errorMessage(title, "Select exactly one rectangle to track.")
+            return None
         shape = self.canvas.selectedShapes[0]
         if shape.shape_type != "rectangle" or len(shape.points) != 2:
-            self.errorMessage(
-                "Track Forward",
-                "Only rectangle bounding boxes can be tracked.",
-            )
-            return
+            self.errorMessage(title, "Only rectangle bounding boxes can be tracked.")
+            return None
+        return shape
 
-        curr_index = self.imageList.index(self.filename)
-        total_frames = len(self.imageList)
-
+    def _getTrackEndFrame(self, title, curr_index, total_frames):
         end_frame, ok = QtWidgets.QInputDialog.getInt(
             self,
-            "Track Forward",
+            title,
             f"Track to frame (current: {curr_index + 1}, total: {total_frames}):",
             total_frames,
             curr_index + 2,
             total_frames,
         )
         if not ok:
+            return None
+        return end_frame
+
+    def trackForward(self):
+        shape = self._getSelectedRect("Track Forward")
+        if shape is None:
+            return
+
+        curr_index = self.imageList.index(self.filename)
+        end_frame = self._getTrackEndFrame(
+            "Track Forward", curr_index, len(self.imageList)
+        )
+        if end_frame is None:
             return
 
         label = shape.label
@@ -1854,66 +1927,22 @@ class MainWindow(QtWidgets.QMainWindow):
         tracker = cv2.TrackerCSRT.create()
         tracker.init(curr_img, (x, y, w, h))
 
-        lf = LabelFile()
         last_tracked = curr_index
         for i in range(curr_index + 1, end_frame):
-            img_path = self.imageList[i]
-            frame = cv2.imread(img_path)
+            frame = cv2.imread(self.imageList[i])
             if frame is None:
                 break
-
             success, bbox = tracker.update(frame)
             if not success:
                 break
-
             bx, by, bw, bh = [int(v) for v in bbox]
-            new_points = [[bx, by], [bx + bw, by + bh]]
-
-            basename = osp.splitext(osp.basename(img_path))[0] + ".json"
-            json_path = osp.splitext(img_path)[0] + ".json"
-            if self.lastOpenDir:
-                alt = osp.join(self.lastOpenDir, basename)
-                if os.path.isfile(alt):
-                    json_path = alt
-
-            if os.path.isfile(json_path):
-                loaded = LabelFile(json_path)
-                shapes = loaded.shapes
-                img_rel = loaded.imagePath
-            else:
-                shapes = []
-                img_rel = osp.basename(img_path)
-
-            updated = False
-            tid_str = str(track_id) if track_id is not None else None
-            for s in shapes:
-                s_tid = str(s.get("track_id") or s.get("group_id"))
-                if s["label"] == label and s_tid == tid_str:
-                    s["points"] = new_points
-                    updated = True
-                    break
-            if not updated:
-                shapes.append(
-                    dict(
-                        label=label,
-                        points=new_points,
-                        group_id=group_id,
-                        track_id=track_id,
-                        shape_type="rectangle",
-                        flags={},
-                        description="",
-                        mask=None,
-                    )
-                )
-
-            lf.save(
-                filename=json_path,
-                shapes=shapes,
-                imagePath=img_rel,
-                imageData=None,
-                imageHeight=curr_img.shape[0],
-                imageWidth=curr_img.shape[1],
-                flags={},
+            self._saveTrackResult(
+                self.imageList[i],
+                label,
+                track_id,
+                group_id,
+                [[bx, by], [bx + bw, by + bh]],
+                curr_img.shape,
             )
             last_tracked = i
 
@@ -1921,6 +1950,95 @@ class MainWindow(QtWidgets.QMainWindow):
         self.loadFile(self.filename)
         self.informationMessage(
             "Track Forward",
+            f"Tracked {label}-{track_id} forward {tracked_count} frames "
+            f"(frame {curr_index + 1} to {last_tracked + 1}).",
+        )
+
+    def trackForwardBoTSORT(self):
+        shape = self._getSelectedRect("Track Forward (BoTSORT)")
+        if shape is None:
+            return
+
+        try:
+            from labelme.track_algo import BoTSORTForwardTracker
+        except ImportError:
+            self.errorMessage(
+                "Track Forward (BoTSORT)",
+                "ultralytics is not installed.\nRun: pip install ultralytics",
+            )
+            return
+
+        curr_index = self.imageList.index(self.filename)
+        end_frame = self._getTrackEndFrame(
+            "Track Forward (BoTSORT)", curr_index, len(self.imageList)
+        )
+        if end_frame is None:
+            return
+
+        label = shape.label
+        track_id = shape.track_id
+        group_id = shape.group_id
+        p1, p2 = shape.points[0], shape.points[1]
+        x1 = int(min(p1.x(), p2.x()))
+        y1 = int(min(p1.y(), p2.y()))
+        x2 = int(max(p1.x(), p2.x()))
+        y2 = int(max(p1.y(), p2.y()))
+
+        curr_img = cv2.imread(self.imageList[curr_index])
+        if curr_img is None:
+            self.errorMessage(
+                "Track Forward (BoTSORT)", "Cannot read current frame image."
+            )
+            return
+
+        progress = QtWidgets.QProgressDialog(
+            "Loading YOLO model...", "Cancel", curr_index, end_frame, self
+        )
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setValue(curr_index)
+        QtWidgets.QApplication.processEvents()
+
+        tracker = BoTSORTForwardTracker(model_name="yolo26x.pt")
+        progress.setLabelText("Running YOLO + BoTSORT tracking...")
+
+        if not tracker.init(curr_img, [x1, y1, x2, y2]):
+            progress.close()
+            self.errorMessage(
+                "Track Forward (BoTSORT)",
+                "No YOLO detection matched the selected box (IOU < 0.3).\n"
+                "Ensure the object is clearly visible.",
+            )
+            return
+
+        last_tracked = curr_index
+        for i in range(curr_index + 1, end_frame):
+            if progress.wasCanceled():
+                break
+            progress.setValue(i)
+            QtWidgets.QApplication.processEvents()
+
+            frame = cv2.imread(self.imageList[i])
+            if frame is None:
+                break
+            success, xyxy = tracker.update(frame)
+            if not success:
+                break
+            self._saveTrackResult(
+                self.imageList[i],
+                label,
+                track_id,
+                group_id,
+                [[int(xyxy[0]), int(xyxy[1])], [int(xyxy[2]), int(xyxy[3])]],
+                curr_img.shape,
+            )
+            last_tracked = i
+
+        progress.close()
+        tracker.reset()
+        tracked_count = last_tracked - curr_index
+        self.loadFile(self.filename)
+        self.informationMessage(
+            "Track Forward (BoTSORT)",
             f"Tracked {label}-{track_id} forward {tracked_count} frames "
             f"(frame {curr_index + 1} to {last_tracked + 1}).",
         )
