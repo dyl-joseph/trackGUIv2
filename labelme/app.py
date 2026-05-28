@@ -2063,18 +2063,23 @@ class MainWindow(QtWidgets.QMainWindow):
 
             bx1, by1, bx2, by2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
 
-            if ai_model is not None:
+            if ai_model is not None and not progress.wasCanceled():
                 rgb_frame = frame[:, :, ::-1]
                 ai_model.set_image(rgb_frame)
-                mask = ai_model.predict_mask_from_box([bx1, by1, bx2, by2])
-                if mask is not None and mask.any():
-                    ys, xs = np.where(mask)
-                    bx1, by1, bx2, by2 = (
-                        int(xs.min()),
-                        int(ys.min()),
-                        int(xs.max()),
-                        int(ys.max()),
-                    )
+                QtWidgets.QApplication.processEvents()
+                if not progress.wasCanceled():
+                    mask = ai_model.predict_mask_from_box([bx1, by1, bx2, by2])
+                    if mask is not None and mask.any():
+                        ys, xs = np.where(mask)
+                        bx1, by1, bx2, by2 = (
+                            int(xs.min()),
+                            int(ys.min()),
+                            int(xs.max()),
+                            int(ys.max()),
+                        )
+
+            if progress.wasCanceled():
+                break
 
             self._saveTrackResult(
                 self.imageList[i],
