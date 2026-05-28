@@ -2285,12 +2285,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.selectedShapes = selected_shapes
         for shape in self.canvas.selectedShapes:
             shape.selected = True
-            item = self.labelList.findItemByShape(shape)
-            self.labelList.selectItem(item)
-            self.labelList.scrollToItem(item)
-            id_item = self.IDList.findItemByShape(shape)
-            self.IDList.selectItem(id_item)
-            self.IDList.scrollToItem(id_item)
+            try:
+                item = self.labelList.findItemByShape(shape)
+                self.labelList.selectItem(item)
+                self.labelList.scrollToItem(item)
+                id_item = self.IDList.findItemByShape(shape)
+                self.IDList.selectItem(id_item)
+                self.IDList.scrollToItem(id_item)
+            except ValueError:
+                pass
         self._noSelectionSlot = False
         n_selected = len(selected_shapes)
         self.actions.delete.setEnabled(n_selected)
