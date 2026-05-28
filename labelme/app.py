@@ -723,6 +723,15 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled=False,
         )
 
+        refine_bbox_ai = action(
+            self.tr("&Refine Bbox (AI)"),
+            self.refineBboxAI,
+            "R",
+            "edit",
+            self.tr("Refine selected bboxes using EfficientSAM"),
+            enabled=False,
+        )
+
         hideSelected = action(
             self.tr("&Hide Selected"),
             self.hideSelectedShape,
@@ -774,6 +783,7 @@ class MainWindow(QtWidgets.QMainWindow):
             DELE=call_deletion,
             trackForward=call_track_forward,
             trackForwardBoTSORT=call_track_forward_botsort,
+            refineBboxAI=refine_bbox_ai,
             duplicate=duplicate,
             copy=copy,
             paste=paste,
@@ -922,6 +932,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 call_deletion,
                 call_track_forward,
                 call_track_forward_botsort,
+                refine_bbox_ai,
             ),
         )
 
@@ -1135,6 +1146,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.DELE.setEnabled(True)
         self.actions.trackForward.setEnabled(True)
         self.actions.trackForwardBoTSORT.setEnabled(True)
+        self.actions.refineBboxAI.setEnabled(True)
         title = __appname__
         if self.filename is not None:
             title = "{} - {}".format(title, self.filename)
@@ -2042,6 +2054,40 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Tracked {label}-{track_id} forward {tracked_count} frames "
             f"(frame {curr_index + 1} to {last_tracked + 1}).",
         )
+
+    def refineBboxAI(self):
+        shapes = [
+            s
+            for s in self.canvas.selectedShapes
+            if s.shape_type == "rectangle" and len(s.points) == 2
+        ]
+        if not shapes:
+            self.errorMessage(
+                "Refine Bbox (AI)",
+                "Select at least one rectangle to refine.",
+            )
+            return
+
+        self.canvas.initializeAiModel("EfficientSam (speed)")
+        ai_model = self.canvas._ai_model
+
+        for shape in shapes:
+            p1, p2 = shape.points[0], shape.points[1]
+            box = [
+                min(p1.x(), p2.x()),
+                min(p1.y(), p2.y()),
+                max(p1.x(), p2.x()),
+                max(p1.y(), p2.y()),
+            ]
+            mask = ai_model.predict_mask_from_box(box)
+            if mask is None or not mask.any():
+                continue
+            ys, xs = np.where(mask)
+            shape.points[0] = QtCore.QPointF(float(xs.min()), float(ys.min()))
+            shape.points[1] = QtCore.QPointF(float(xs.max()), float(ys.max()))
+
+        self.canvas.update()
+        self.setDirty()
 
     def editID(self, item=None):
         if item and not isinstance(item, IDListWidgetItem):

@@ -67,6 +67,11 @@ class EfficientSam:
         mask = self.predict_mask_from_points(points=points, point_labels=point_labels)
         return _utils.compute_polygon_from_mask(mask=mask)
 
+    def predict_mask_from_box(self, box_xyxy):
+        points = [[box_xyxy[0], box_xyxy[1]], [box_xyxy[2], box_xyxy[3]]]
+        point_labels = [2, 3]
+        return self.predict_mask_from_points(points=points, point_labels=point_labels)
+
 
 def _compute_mask_from_points(
     decoder_session, image, image_embedding, points, point_labels
