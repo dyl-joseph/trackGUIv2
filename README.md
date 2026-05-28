@@ -52,25 +52,29 @@ TrackMe annotation format is compatible with LabelMe annotation format (.json) w
 
 10. **Crash on non-numeric track_id** — `_get_rgb_by_label()` called `int()` on track IDs like `"defect"`, causing a `ValueError`. Added try/except fallback (`labelme/app.py`).
 
+11. **Crash on key release after shape modification** — `keyReleaseEvent` in canvas assumed the selected shape was always in the shapes list, causing a `ValueError` crash after operations like bbox refinement or deletion. Added guard with try/except (`labelme/widgets/canvas.py`).
+
+12. **Slow frame navigation (D/A keys)** — `loadFile()` parsed the JSON annotation file twice per frame (once for interpolation state, once for labels). Consolidated into a single parse. Also deferred `BrightnessContrastDialog` creation to only when brightness/contrast values are active, avoiding unnecessary QDialog + PIL conversion on every frame (`labelme/app.py`).
+
 ### Enhancements
 
-11. **Track Forward (CSRT)** — Select a rectangle bounding box and press **Ctrl+T** (or Track > Track Forward (CSRT)) to propagate it across subsequent frames using OpenCV's CSRT tracker. Stops automatically if tracking confidence drops (`labelme/app.py`).
+13. **Track Forward (CSRT)** — Select a rectangle bounding box and press **Ctrl+T** (or Track > Track Forward (CSRT)) to propagate it across subsequent frames using OpenCV's CSRT tracker. Stops automatically if tracking confidence drops (`labelme/app.py`).
 
-12. **Track Forward (BoTSORT)** — Select a rectangle and press **Ctrl+Shift+T** (or Track > Track Forward (BoTSORT)). Uses YOLO (yolo26x.pt) for detection and BoTSORT for multi-object association. IOU-matches the user's bbox to a YOLO detection, then follows that track across frames. More robust than CSRT for occlusion and scale changes. Includes optional "Refine with EfficientSAM" checkbox to tighten each tracked bbox using AI segmentation (`labelme/app.py`, `labelme/track_algo/botsort_tracker.py`).
+14. **Track Forward (BoTSORT)** — Select a rectangle and press **Ctrl+Shift+T** (or Track > Track Forward (BoTSORT)). Uses YOLO (yolo26x.pt) for detection and BoTSORT for multi-object association. IOU-matches the user's bbox to a YOLO detection, then follows that track across frames. More robust than CSRT for occlusion and scale changes. Includes optional "Refine with EfficientSAM" checkbox to tighten each tracked bbox using AI segmentation (`labelme/app.py`, `labelme/track_algo/botsort_tracker.py`).
 
-13. **Refine Bbox (AI)** — Select one or more rectangles and press **R** (or Track > Refine Bbox (AI)). Uses EfficientSAM to generate a segmentation mask from the bbox and extracts a tighter bounding box. Works with any bbox source — BoTSORT, CSRT, manual, or SORT (`labelme/app.py`, `labelme/ai/efficient_sam.py`).
+15. **Refine Bbox (AI)** — Select one or more rectangles and press **R** (or Track > Refine Bbox (AI)). Uses EfficientSAM with a 5-point box prompt (4 corners + center) to generate a segmentation mask, then extracts a tighter bounding box clipped to the original region. Works with any bbox source — BoTSORT, CSRT, manual, or SORT (`labelme/app.py`, `labelme/ai/efficient_sam.py`).
 
-14. **Track ID displayed on bounding boxes** — Each bounding box now renders its `track_id` (or `group_id` as fallback) in white text above the top-left corner of the shape on the canvas (`labelme/shape.py`).
+16. **Track ID displayed on bounding boxes** — Each bounding box now renders its `track_id` (or `group_id` as fallback) in white text above the top-left corner of the shape on the canvas (`labelme/shape.py`).
 
-15. **Backward compatibility with standard LabelMe annotations** — When loading JSON files that have `group_id` but no `track_id`, the loader falls back to using `group_id` as the `track_id` (`labelme/label_file.py`).
+17. **Backward compatibility with standard LabelMe annotations** — When loading JSON files that have `group_id` but no `track_id`, the loader falls back to using `group_id` as the `track_id` (`labelme/label_file.py`).
 
-16. **Hide selected shape** — Press **H** to hide the currently selected shape from the canvas (`labelme/app.py`).
+18. **Hide selected shape** — Press **H** to hide the currently selected shape from the canvas (`labelme/app.py`).
 
-17. **Flexible image path resolution** — When JSON annotations reference images, the loader checks multiple candidate paths: next to the JSON, same name with `.jpg`, subdirectory without `labelme_` prefix (e.g., `labelme_video0784/video0784/`), and sibling directory (`labelme/label_file.py`).
+19. **Flexible image path resolution** — When JSON annotations reference images, the loader checks multiple candidate paths: next to the JSON, same name with `.jpg`, subdirectory without `labelme_` prefix (e.g., `labelme_video0784/video0784/`), and sibling directory (`labelme/label_file.py`).
 
 ### Code Quality
 
-18. **Ruff formatting applied** — The entire codebase has been reformatted with `ruff format` (line length 88, double quotes, 4-space indent, isort-sorted imports) for consistent code style.
+20. **Ruff formatting applied** — The entire codebase has been reformatted with `ruff format` (line length 88, double quotes, 4-space indent, isort-sorted imports) for consistent code style.
 
 ## Installation
 

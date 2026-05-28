@@ -970,8 +970,17 @@ class Canvas(QtWidgets.QWidget):
                 self.snapping = True
         elif self.editing():
             if self.movingShape and self.selectedShapes:
-                index = self.shapes.index(self.selectedShapes[0])
-                if self.shapesBackups[-1][index].points != self.shapes[index].points:
+                try:
+                    index = self.shapes.index(self.selectedShapes[0])
+                except ValueError:
+                    self.movingShape = False
+                    return
+                if (
+                    self.shapesBackups
+                    and index < len(self.shapesBackups[-1])
+                    and self.shapesBackups[-1][index].points
+                    != self.shapes[index].points
+                ):
                     self.storeShapes()
                     self.shapeMoved.emit()
 

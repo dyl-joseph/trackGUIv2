@@ -2750,11 +2750,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if os.path.isfile(alt):
                 label_file = alt
 
-        if os.path.isfile(label_file):
-            self.ir_old_shapes = []
-            for item in LabelFile(label_file).shapes:
-                self.ir_old_shapes.append(item)
-
         if self.output_dir:
             label_file_without_path = osp.basename(label_file)
             label_file = osp.join(self.output_dir, label_file_without_path)
@@ -2773,6 +2768,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 self.status(self.tr("Error reading %s") % label_file)
                 return False
+            self.ir_old_shapes = list(self.labelFile.shapes)
             self.imageData = self.labelFile.imageData
             self.imagePath = osp.join(
                 osp.dirname(label_file),
@@ -2782,6 +2778,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.imageData is None:
                 self.imageData = LabelFile.load_image_file(filename)
         else:
+            self.ir_old_shapes = []
             self.imageData = LabelFile.load_image_file(filename)
             if self.imageData:
                 self.imagePath = filename
@@ -2846,11 +2843,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     orientation, self.scroll_values[orientation][self.filename]
                 )
         # set brightness contrast values
-        dialog = BrightnessContrastDialog(
-            utils.img_data_to_pil(self.imageData),
-            self.onNewBrightnessContrast,
-            parent=self,
-        )
         brightness, contrast = self.brightnessContrast_values.get(
             self.filename, (None, None)
         )
@@ -2862,12 +2854,17 @@ class MainWindow(QtWidgets.QMainWindow):
             _, contrast = self.brightnessContrast_values.get(
                 self.recentFiles[0], (None, None)
             )
-        if brightness is not None:
-            dialog.slider_brightness.setValue(brightness)
-        if contrast is not None:
-            dialog.slider_contrast.setValue(contrast)
         self.brightnessContrast_values[self.filename] = (brightness, contrast)
         if brightness is not None or contrast is not None:
+            dialog = BrightnessContrastDialog(
+                utils.img_data_to_pil(self.imageData),
+                self.onNewBrightnessContrast,
+                parent=self,
+            )
+            if brightness is not None:
+                dialog.slider_brightness.setValue(brightness)
+            if contrast is not None:
+                dialog.slider_contrast.setValue(contrast)
             dialog.onNewValue(None)
         self.paintCanvas()
         self.addRecentFile(self.filename)
@@ -3041,7 +3038,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.filename = filename
 
             if self.filename and load:
-                self.loadFile(self.filename)
+                self._scheduleNav(self.filename)
 
             self._config["keep_prev"] = keep_prev
         else:
@@ -3053,7 +3050,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.filename = filename
 
             if self.filename and load:
-                self.loadFile(self.filename)
+                self._scheduleNav(self.filename)
 
             self._config["keep_prev"] = keep_prev
 

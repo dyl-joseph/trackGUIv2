@@ -68,9 +68,22 @@ class EfficientSam:
         return _utils.compute_polygon_from_mask(mask=mask)
 
     def predict_mask_from_box(self, box_xyxy):
-        points = [[box_xyxy[0], box_xyxy[1]], [box_xyxy[2], box_xyxy[3]]]
-        point_labels = [2, 3]
-        return self.predict_mask_from_points(points=points, point_labels=point_labels)
+        x1, y1, x2, y2 = box_xyxy
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        # box corners with SAM box labels + center positive point
+        mask = self.predict_mask_from_points(
+            points=[[x1, y1], [x2, y2], [x1, y2], [x2, y1], [cx, cy]],
+            point_labels=[2, 3, 2, 3, 1],
+        )
+        if mask is not None and mask.any():
+            # clip mask to original box region
+            h, w = mask.shape
+            clip = np.zeros_like(mask)
+            r1, c1 = max(0, int(y1)), max(0, int(x1))
+            r2, c2 = min(h, int(y2) + 1), min(w, int(x2) + 1)
+            clip[r1:r2, c1:c2] = True
+            mask = mask & clip
+        return mask
 
 
 def _compute_mask_from_points(
