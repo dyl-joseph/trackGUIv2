@@ -3038,7 +3038,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.filename = filename
 
             if self.filename and load:
-                self._scheduleNav(self.filename)
+                self.loadFile(self.filename)
 
             self._config["keep_prev"] = keep_prev
         else:
@@ -3050,7 +3050,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.filename = filename
 
             if self.filename and load:
-                self._scheduleNav(self.filename)
+                self.loadFile(self.filename)
 
             self._config["keep_prev"] = keep_prev
 
