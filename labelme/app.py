@@ -1063,6 +1063,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.populateModeActions()
 
+        self._save_timer = QtCore.QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self._debouncedSave)
+
+        self._imageListCache = None
+
         # self.firstStart = True
         # if self.firstStart:
         #    QWhatsThis.enterWhatsThisMode()
@@ -1121,7 +1128,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def setDirty(self):
         self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
         if self._config["auto_save"] or self.actions.saveAuto.isChecked():
-            self.saveLabels(self._resolveJsonPath())
+            self._save_timer.start()
             return
         self.dirty = True
         self.actions.save.setEnabled(True)
@@ -1129,6 +1136,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.filename is not None:
             title = "{} - {}*".format(title, self.filename)
         self.setWindowTitle(title)
+
+    def _debouncedSave(self):
+        if self.filename:
+            self.saveLabels(self._resolveJsonPath())
 
     def setClean(self):
         self.dirty = False
@@ -2373,8 +2384,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def loadShapes(self, shapes, replace=True):
         self._noSelectionSlot = True
+        self.labelList.blockSignals(True)
+        self.IDList.blockSignals(True)
         for shape in shapes:
             self.addLabel(shape)
+        self.labelList.blockSignals(False)
+        self.IDList.blockSignals(False)
         self.labelList.clearSelection()
         self.IDList.clearSelection()
         self._noSelectionSlot = False
@@ -2724,6 +2739,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def loadFile(self, filename=None):
         """Load the specified file, or the last opened file if None."""
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self._debouncedSave()
         # changing fileListWidget loads file
         if filename in self.imageList and (
             self.fileListWidget.currentRow() != self.imageList.index(filename)
@@ -2773,6 +2791,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
             self.ir_old_shapes = list(self.labelFile.shapes)
             self.imageData = self.labelFile.imageData
+            self.labelFile.imageData = None
             self.imagePath = osp.join(
                 osp.dirname(label_file),
                 self.labelFile.imagePath,
@@ -3320,11 +3339,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @property
     def imageList(self):
-        lst = []
-        for i in range(self.fileListWidget.count()):
-            item = self.fileListWidget.item(i)
-            lst.append(item.text())
-        return lst
+        if self._imageListCache is None:
+            lst = []
+            for i in range(self.fileListWidget.count()):
+                item = self.fileListWidget.item(i)
+                lst.append(item.text())
+            self._imageListCache = lst
+        return self._imageListCache
 
     def importDroppedImageFiles(self, imageFiles):
         extensions = [
@@ -3349,6 +3370,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 item.setCheckState(Qt.Unchecked)
             self.fileListWidget.addItem(item)
+            self._imageListCache = None
 
         if len(self.imageList) > 1:
             self.actions.openNextImg.setEnabled(True)
@@ -3387,6 +3409,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 item.setCheckState(Qt.Unchecked)
             self.fileListWidget.addItem(item)
+        self._imageListCache = None
         self.openNextImg(load=load)
 
     def scanAllImages(self, folderPath):

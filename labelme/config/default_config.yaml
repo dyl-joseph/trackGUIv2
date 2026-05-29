@@ -329,7 +329,7 @@ canvas:
   # close: close polygon
   double_click: close
   # The max number of edits we can undo
-  num_backups: 10
+  num_backups: 5
   # show crosshair
   crosshair:
     polygon: false

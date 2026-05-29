@@ -1,4 +1,3 @@
-import copy
 import math
 
 import numpy as np
@@ -73,6 +72,10 @@ class Shape(object):
         }
 
         self._closed = False
+        self._cached_path = None
+        self._cached_mask_qimage = None
+        self._cached_mask_path = None
+        self._cached_mask_key = None
 
         if line_color is not None:
             # Override the class line_color attribute
@@ -80,18 +83,26 @@ class Shape(object):
             # is used for drawing the pending line a different color.
             self.line_color = line_color
 
+    def _invalidate_cache(self):
+        self._cached_path = None
+        self._cached_mask_qimage = None
+        self._cached_mask_path = None
+        self._cached_mask_key = None
+
     def setShapeRefined(self, shape_type, points, point_labels, mask=None):
         self._shape_raw = (self.shape_type, self.points, self.point_labels)
         self.shape_type = shape_type
         self.points = points
         self.point_labels = point_labels
         self.mask = mask
+        self._invalidate_cache()
 
     def restoreShapeRaw(self):
         if self._shape_raw is None:
             return
         self.shape_type, self.points, self.point_labels = self._shape_raw
         self._shape_raw = None
+        self._invalidate_cache()
 
     @property
     def shape_type(self):
@@ -113,9 +124,12 @@ class Shape(object):
         ]:
             raise ValueError("Unexpected shape_type: {}".format(value))
         self._shape_type = value
+        if hasattr(self, "_cached_path"):
+            self._invalidate_cache()
 
     def close(self):
         self._closed = True
+        self._cached_path = None
 
     def addPoint(self, point, label=1):
         if self.points and point == self.points[0]:
@@ -123,6 +137,7 @@ class Shape(object):
         else:
             self.points.append(point)
             self.point_labels.append(label)
+            self._cached_path = None
 
     def canAddPoint(self):
         return self.shape_type in ["polygon", "linestrip"]
@@ -131,12 +146,14 @@ class Shape(object):
         if self.points:
             if self.point_labels:
                 self.point_labels.pop()
+            self._cached_path = None
             return self.points.pop()
         return None
 
     def insertPoint(self, i, point, label=1):
         self.points.insert(i, point)
         self.point_labels.insert(i, label)
+        self._cached_path = None
 
     def removePoint(self, i):
         if not self.canAddPoint():
@@ -164,6 +181,7 @@ class Shape(object):
 
         self.points.pop(i)
         self.point_labels.pop(i)
+        self._cached_path = None
 
     def isClosed(self):
         return self._closed
@@ -187,28 +205,35 @@ class Shape(object):
         painter.setPen(pen)
 
         if self.mask is not None:
-            image_to_draw = np.zeros(self.mask.shape + (4,), dtype=np.uint8)
             fill_color = (
                 self.select_fill_color.getRgb()
                 if self.selected
                 else self.fill_color.getRgb()
             )
-            image_to_draw[self.mask] = fill_color
-            qimage = QtGui.QImage.fromData(labelme.utils.img_arr_to_data(image_to_draw))
-            painter.drawImage(
-                int(round(self.points[0].x())),
-                int(round(self.points[0].y())),
-                qimage,
-            )
-
-            line_path = QtGui.QPainterPath()
-            contours = skimage.measure.find_contours(np.pad(self.mask, pad_width=1))
-            for contour in contours:
-                contour += [self.points[0].y(), self.points[0].x()]
-                line_path.moveTo(contour[0, 1], contour[0, 0])
-                for point in contour[1:]:
-                    line_path.lineTo(point[1], point[0])
-            painter.drawPath(line_path)
+            ox = int(round(self.points[0].x()))
+            oy = int(round(self.points[0].y()))
+            cache_key = (id(self.mask), fill_color, ox, oy)
+            if self._cached_mask_key != cache_key:
+                image_to_draw = np.zeros(
+                    self.mask.shape + (4,), dtype=np.uint8
+                )
+                image_to_draw[self.mask] = fill_color
+                self._cached_mask_qimage = QtGui.QImage.fromData(
+                    labelme.utils.img_arr_to_data(image_to_draw)
+                )
+                line_path = QtGui.QPainterPath()
+                contours = skimage.measure.find_contours(
+                    np.pad(self.mask, pad_width=1)
+                )
+                for contour in contours:
+                    contour += [self.points[0].y(), self.points[0].x()]
+                    line_path.moveTo(contour[0, 1], contour[0, 0])
+                    for point in contour[1:]:
+                        line_path.lineTo(point[1], point[0])
+                self._cached_mask_path = line_path
+                self._cached_mask_key = cache_key
+            painter.drawImage(ox, oy, self._cached_mask_qimage)
+            painter.drawPath(self._cached_mask_path)
 
         if self.points:
             line_path = QtGui.QPainterPath()
@@ -342,6 +367,8 @@ class Shape(object):
         return rectangle
 
     def makePath(self):
+        if self._cached_path is not None:
+            return self._cached_path
         if self.shape_type in ["rectangle", "mask"]:
             path = QtGui.QPainterPath()
             if len(self.points) == 2:
@@ -356,6 +383,7 @@ class Shape(object):
             path = QtGui.QPainterPath(self.points[0])
             for p in self.points[1:]:
                 path.lineTo(p)
+        self._cached_path = path
         return path
 
     def boundingRect(self):
@@ -363,9 +391,11 @@ class Shape(object):
 
     def moveBy(self, offset):
         self.points = [p + offset for p in self.points]
+        self._cached_path = None
 
     def moveVertexBy(self, i, offset):
         self.points[i] = self.points[i] + offset
+        self._cached_path = None
 
     def highlightVertex(self, i, action):
         """Highlight a vertex appropriately based on the current action
@@ -383,7 +413,31 @@ class Shape(object):
         self._highlightIndex = None
 
     def copy(self):
-        return copy.deepcopy(self)
+        s = Shape(
+            label=self.label,
+            shape_type=self._shape_type,
+            flags=dict(self.flags) if isinstance(self.flags, dict) else self.flags,
+            group_id=self.group_id,
+            track_id=self.track_id,
+            description=self.description,
+            mask=self.mask,
+        )
+        s.points = [QtCore.QPointF(p) for p in self.points]
+        s.point_labels = list(self.point_labels)
+        s.fill = self.fill
+        s.selected = self.selected
+        s._closed = self._closed
+        s.other_data = self.other_data.copy()
+        if self._shape_raw is not None:
+            raw_type, raw_pts, raw_labels = self._shape_raw
+            s._shape_raw = (
+                raw_type,
+                [QtCore.QPointF(p) for p in raw_pts],
+                list(raw_labels),
+            )
+        if hasattr(self, "line_color") and "line_color" in self.__dict__:
+            s.line_color = self.line_color
+        return s
 
     def __len__(self):
         return len(self.points)
@@ -393,3 +447,4 @@ class Shape(object):
 
     def __setitem__(self, key, value):
         self.points[key] = value
+        self._cached_path = None

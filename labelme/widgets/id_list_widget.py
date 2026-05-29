@@ -107,6 +107,7 @@ class IDListWidget(QtWidgets.QListView):
     def __init__(self):
         super(IDListWidget, self).__init__()
         self._selectedItems = []
+        self._shape_to_item = {}
 
         self.setWindowFlags(Qt.Window)
         self.setModel(StandardItemModel())
@@ -156,8 +157,14 @@ class IDListWidget(QtWidgets.QListView):
             raise TypeError("item must be IDListWidgetItem")
         self.model().setItem(self.model().rowCount(), 0, item)
         item.setSizeHint(self.itemDelegate().sizeHint(None, None))
+        shape = item.shape()
+        if shape is not None:
+            self._shape_to_item[id(shape)] = item
 
     def removeItem(self, item):
+        shape = item.shape()
+        if shape is not None:
+            self._shape_to_item.pop(id(shape), None)
         index = self.model().indexFromItem(item)
         self.model().removeRows(index.row(), 1)
 
@@ -166,11 +173,16 @@ class IDListWidget(QtWidgets.QListView):
         self.selectionModel().select(index, QtCore.QItemSelectionModel.Select)
 
     def findItemByShape(self, shape):
+        item = self._shape_to_item.get(id(shape))
+        if item is not None:
+            return item
         for row in range(self.model().rowCount()):
             item = self.model().item(row, 0)
             if item.shape() == shape:
+                self._shape_to_item[id(shape)] = item
                 return item
         raise ValueError("cannot find shape: {}".format(shape))
 
     def clear(self):
+        self._shape_to_item.clear()
         self.model().clear()

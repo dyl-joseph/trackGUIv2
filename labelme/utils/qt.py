@@ -1,7 +1,6 @@
 import os.path as osp
 from math import sqrt
 
-import numpy as np
 from qtpy import QtCore
 from qtpy import QtGui
 from qtpy import QtWidgets
@@ -81,16 +80,17 @@ def distance(p):
 
 def distancetoline(point, line):
     p1, p2 = line
-    p1 = np.array([p1.x(), p1.y()])
-    p2 = np.array([p2.x(), p2.y()])
-    p3 = np.array([point.x(), point.y()])
-    if np.dot((p3 - p1), (p2 - p1)) < 0:
-        return np.linalg.norm(p3 - p1)
-    if np.dot((p3 - p2), (p1 - p2)) < 0:
-        return np.linalg.norm(p3 - p2)
-    if np.linalg.norm(p2 - p1) == 0:
-        return np.linalg.norm(p3 - p1)
-    return np.linalg.norm(np.cross(p2 - p1, p1 - p3)) / np.linalg.norm(p2 - p1)
+    p1x, p1y = p1.x(), p1.y()
+    p2x, p2y = p2.x(), p2.y()
+    p3x, p3y = point.x(), point.y()
+    dx, dy = p2x - p1x, p2y - p1y
+    if dx == 0 and dy == 0:
+        return sqrt((p3x - p1x) ** 2 + (p3y - p1y) ** 2)
+    if (p3x - p1x) * dx + (p3y - p1y) * dy < 0:
+        return sqrt((p3x - p1x) ** 2 + (p3y - p1y) ** 2)
+    if (p3x - p2x) * (-dx) + (p3y - p2y) * (-dy) < 0:
+        return sqrt((p3x - p2x) ** 2 + (p3y - p2y) ** 2)
+    return abs(dx * (p1y - p3y) - dy * (p1x - p3x)) / sqrt(dx * dx + dy * dy)
 
 
 def fmtShortcut(text):

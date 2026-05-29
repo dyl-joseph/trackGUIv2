@@ -119,7 +119,7 @@ class LabelFile(object):
             imagePath = data["imagePath"]
             if imageData is not None:
                 self._check_image_height_and_width(
-                    base64.b64encode(imageData).decode("utf-8"),
+                    imageData,
                     data.get("imageHeight"),
                     data.get("imageWidth"),
                 )
@@ -155,19 +155,22 @@ class LabelFile(object):
 
     @staticmethod
     def _check_image_height_and_width(imageData, imageHeight, imageWidth):
-        img_arr = utils.img_b64_to_arr(imageData)
-        if imageHeight is not None and img_arr.shape[0] != imageHeight:
+        if imageHeight is None and imageWidth is None:
+            return imageHeight, imageWidth
+        img = PIL.Image.open(io.BytesIO(imageData))
+        w, h = img.size
+        if imageHeight is not None and h != imageHeight:
             logger.error(
                 "imageHeight does not match with imageData or imagePath, "
                 "so getting imageHeight from actual image."
             )
-            imageHeight = img_arr.shape[0]
-        if imageWidth is not None and img_arr.shape[1] != imageWidth:
+            imageHeight = h
+        if imageWidth is not None and w != imageWidth:
             logger.error(
                 "imageWidth does not match with imageData or imagePath, "
                 "so getting imageWidth from actual image."
             )
-            imageWidth = img_arr.shape[1]
+            imageWidth = w
         return imageHeight, imageWidth
 
     def save(
