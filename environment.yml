@@ -3,26 +3,10 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - bzip2=1.0.8
-  - ca-certificates=2026.5.20
-  - libexpat=2.8.1
-  - libffi=3.5.2
-  - liblzma=5.8.3
-  - liblzma-devel=5.8.3
-  - libsqlite=3.53.1
-  - libzlib=1.3.2
-  - ncurses=6.6
-  - openssl=3.6.2
-  - pip=24.3.1
-  - python=3.9.23
-  - readline=8.3
-  - setuptools=75.3.0
-  - tk=8.6.13
-  - tzdata=2025c
-  - wheel=0.45.1
-  - xz=5.8.3
-  - xz-gpl-tools=5.8.3
-  - xz-tools=5.8.3
+  - python=3.9
+  - pip
+  - setuptools
+  - wheel
   - pip:
       - beautifulsoup4==4.14.3
       - certifi==2026.5.20
@@ -78,4 +62,3 @@ dependencies:
       - typing-extensions==4.15.0
       - urllib3==2.6.3
       - zipp==3.23.1
-prefix: /Users/dylanjoseph/miniconda3/envs/trackGUI
