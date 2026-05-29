@@ -644,7 +644,11 @@ class Canvas(QtWidgets.QWidget):
             for shape in self.selectedShapes:
                 if shape in self.shapes:
                     self.shapes.remove(shape)
+<<<<<<< HEAD
                     deleted_shapes.append(shape)
+=======
+                deleted_shapes.append(shape)
+>>>>>>> 42c5ccb5aec19663bb805aad7eff135e2c544bbe
             self.storeShapes()
             self.selectedShapes = []
             self.update()
