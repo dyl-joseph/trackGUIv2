@@ -3,10 +3,13 @@ import shutil
 import tempfile
 
 import pytest
+from qtpy import QtCore
+from qtpy import QtWidgets
 
 import labelme.app
 import labelme.config
 import labelme.testing
+from labelme.shape import Shape
 
 here = osp.dirname(osp.abspath(__file__))
 data_dir = osp.join(here, "data")
@@ -112,3 +115,50 @@ def test_MainWindow_annotate_jpg(qtbot):
 
     labelme.testing.assert_labelfile_sanity(out_file)
     shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
+def test_new_shape_uses_single_prompt_and_auto_track_id(qtbot):
+    class FakeLabelDialog:
+        def __init__(self):
+            self.edit = QtWidgets.QLineEdit()
+            self.popups = 0
+
+        def popUp(self, text=None):
+            self.popups += 1
+            return "person", {}, None, ""
+
+        def addLabelHistory(self, label):
+            pass
+
+    class FailingIDDialog:
+        def __init__(self):
+            self.edit = QtWidgets.QLineEdit()
+            self.history = []
+
+        def popUp(self, text=None):
+            raise AssertionError("newShape should not open the ID dialog")
+
+        def addIDHistory(self, track_id):
+            self.history.append(track_id)
+
+    config = labelme.config.get_default_config()
+    win = labelme.app.MainWindow(config=config)
+    qtbot.addWidget(win)
+    win.mode = "NORMAL"
+    win.labelDialog = FakeLabelDialog()
+    win.IDDialog = FailingIDDialog()
+
+    shape = Shape(shape_type="rectangle")
+    shape.addPoint(QtCore.QPointF(10, 10))
+    shape.addPoint(QtCore.QPointF(20, 20))
+    shape.close()
+    win.canvas.shapes.append(shape)
+    win.canvas.storeShapes()
+
+    win.newShape()
+
+    assert win.labelDialog.popups == 1
+    assert shape.label == "person"
+    assert shape.track_id == "1"
+    assert win.IDDialog.history == ["1"]

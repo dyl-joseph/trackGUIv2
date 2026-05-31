@@ -123,6 +123,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fit_to_content=self._config["fit_to_content"],
             flags=self._config["label_flags"],
         )
+        self.labelDialog.edit_group_id.setPlaceholderText("Track ID")
 
         self.IDDialog = IDDialog(
             parent=self,
@@ -2581,6 +2582,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # Callback functions:
 
+    def _nextTrackId(self):
+        used_track_ids = set()
+        for shape in self.canvas.shapes:
+            for value in (shape.track_id, shape.group_id):
+                if value is None:
+                    continue
+                value = str(value).strip()
+                if value.isdigit():
+                    used_track_ids.add(int(value))
+
+        track_id = 1
+        while track_id in used_track_ids:
+            track_id += 1
+        return str(track_id)
+
     def newShape(self):
         """Pop-up and give focus to the label editor.
 
@@ -2596,12 +2612,12 @@ class MainWindow(QtWidgets.QMainWindow):
         description = ""
         if self._config["display_label_popup"] or not text_label:
             previous_text_label = self.labelDialog.edit.text()
-            previous_text_id = self.IDDialog.edit.text()
             if self.mode == "NORMAL":
                 text_label, flags, group_id, description = self.labelDialog.popUp(
                     text_label
                 )
-                text_id = self.IDDialog.popUp(text_id)
+                if group_id is not None:
+                    text_id = str(group_id)
             else:
                 text_label = self.label_INPO
                 flags = {}
@@ -2610,8 +2626,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 text_id = self.ID_INPO
             if not text_label:
                 self.labelDialog.edit.setText(previous_text_label)
-            if not text_id:
-                self.IDDialog.edit.setText(previous_text_id)
 
         if text_label and not self.validateLabel(text_label):
             self.errorMessage(
@@ -2622,6 +2636,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             text_label = ""
         if text_label:
+            if not text_id:
+                text_id = self._nextTrackId()
             self.labelList.clearSelection()
             self.IDList.clearSelection()
             shape = self.canvas.setLastLabel(text_label, flags)
