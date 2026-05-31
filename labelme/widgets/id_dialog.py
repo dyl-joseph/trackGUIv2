@@ -46,17 +46,9 @@ class IDDialog(QtWidgets.QDialog):
         self.edit.setValidator(labelme.utils.labelValidator())
         self.edit.editingFinished.connect(self.postProcess)
 
-        self.edit_track_id = QtWidgets.QLineEdit()
-        self.edit_track_id.setPlaceholderText("Track ID")
-        self.edit_track_id.setValidator(
-            QtGui.QRegExpValidator(QtCore.QRegExp(r"\d*"), None)
-        )
         layout = QtWidgets.QVBoxLayout()
         if show_text_field:
-            layout_edit = QtWidgets.QHBoxLayout()
-            layout_edit.addWidget(self.edit, 6)
-            layout_edit.addWidget(self.edit_track_id, 2)
-            layout.addLayout(layout_edit)
+            layout.addWidget(self.edit)
         # buttons
         self.buttonBox = bb = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
@@ -117,6 +109,8 @@ class IDDialog(QtWidgets.QDialog):
             self.IDList.sortItems()
 
     def IDSelected(self, item):
+        if item is None:
+            return
         self.edit.setText(item.text())
 
     def validate(self):

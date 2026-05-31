@@ -75,16 +75,6 @@ class LabelFile(object):
             "imageHeight",
             "imageWidth",
         ]
-        shape_keys = [
-            "label",
-            "points",
-            "group_id",
-            "track_id",
-            "shape_type",
-            "flags",
-            "description",
-            "mask",
-        ]
         try:
             with open(filename, "r") as f:
                 data = json.load(f)

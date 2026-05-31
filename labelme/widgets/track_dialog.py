@@ -1,5 +1,6 @@
 from qtpy import QtWidgets
 
+
 class TrackDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super(TrackDialog, self).__init__(parent)

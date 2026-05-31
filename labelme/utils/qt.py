@@ -66,7 +66,7 @@ def addActions(widget, actions):
 
 
 def labelValidator():
-    return QtGui.QRegExpValidator(QtCore.QRegExp(r"^[^ \t].+"), None)
+    return QtGui.QRegExpValidator(QtCore.QRegExp(r"^[^ \t].*"), None)
 
 
 class struct(object):

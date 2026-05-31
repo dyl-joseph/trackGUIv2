@@ -51,9 +51,7 @@ class LabelDialog(QtWidgets.QDialog):
             self.edit.textChanged.connect(self.updateFlags)
         self.edit_group_id = QtWidgets.QLineEdit()
         self.edit_group_id.setPlaceholderText("Group ID")
-        self.edit_group_id.setValidator(
-            QtGui.QRegExpValidator(QtCore.QRegExp(r"\d*"), None)
-        )
+        self.edit_group_id.setValidator(labelme.utils.labelValidator())
         layout = QtWidgets.QVBoxLayout()
         if show_text_field:
             layout_edit = QtWidgets.QHBoxLayout()
@@ -134,6 +132,8 @@ class LabelDialog(QtWidgets.QDialog):
             self.labelList.sortItems()
 
     def labelSelected(self, item):
+        if item is None:
+            return
         self.edit.setText(item.text())
 
     def validate(self):
@@ -143,6 +143,12 @@ class LabelDialog(QtWidgets.QDialog):
         else:
             text = text.trimmed()
         if text:
+            items = self.labelList.findItems(text, QtCore.Qt.MatchStartsWith)
+            exact_items = self.labelList.findItems(text, QtCore.Qt.MatchExactly)
+            if len(items) == 1 and not exact_items:
+                self.edit.setText(items[0].text())
+                self.edit.setSelection(0, len(self.edit.text()))
+                return
             self.accept()
 
     def labelDoubleClicked(self, item):
@@ -199,9 +205,15 @@ class LabelDialog(QtWidgets.QDialog):
 
     def getGroupId(self):
         group_id = self.edit_group_id.text()
-        if group_id:
+        if hasattr(group_id, "strip"):
+            group_id = group_id.strip()
+        else:
+            group_id = group_id.trimmed()
+        if not group_id:
+            return None
+        if group_id.isdigit():
             return int(group_id)
-        return None
+        return group_id
 
     def popUp(self, text=None, move=True, flags=None, group_id=None, description=None):
         if self._fit_to_content["row"]:

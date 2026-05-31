@@ -1,8 +1,8 @@
 --- Installation
-conda create --name=trackGUI python=3.8
+conda env create -f environment.yml
 conda activate trackGUI
 pip install -e .
---- Run the program and input this into the terminal. This program can only run in this "labelme" conda environment.
+--- Run the program from any supported OS after activating the environment.
 conda activate trackGUI
 labelme
 

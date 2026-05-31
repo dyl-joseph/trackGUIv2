@@ -1,5 +1,5 @@
 from qtpy import QtWidgets
-from qtpy.QtCore import Qt
+
 
 class InterpolationDialog(QtWidgets.QDialog):
     def __init__(self, min_val, max_val, parent=None):

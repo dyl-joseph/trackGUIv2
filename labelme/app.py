@@ -1195,8 +1195,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def currentItem(self):
         items_l = self.labelList.selectedItems()
         items_i = self.IDList.selectedItems()
-        if items_l:
+        if items_l and items_i:
             return items_l[0], items_i[0]
+        if items_l:
+            shape = items_l[0].shape()
+            try:
+                return items_l[0], self.IDList.findItemByShape(shape)
+            except ValueError:
+                return items_l[0], None
+        if items_i:
+            shape = items_i[0].shape()
+            try:
+                return self.labelList.findItemByShape(shape), items_i[0]
+            except ValueError:
+                return None, items_i[0]
         return None, None
 
     def addRecentFile(self, filename):
@@ -1372,15 +1384,15 @@ class MainWindow(QtWidgets.QMainWindow):
                                 "You must label all objects' IDs.",
                             )
                             return
-                        for l in range(len(bboxes_xywh)):
+                        for box_index in range(len(bboxes_xywh)):
                             lines.append(
                                 [
                                     frame_id,
-                                    int(track_ids[l]),
-                                    bboxes_xywh[l][0],
-                                    bboxes_xywh[l][1],
-                                    bboxes_xywh[l][2],
-                                    bboxes_xywh[l][3],
+                                    int(track_ids[box_index]),
+                                    bboxes_xywh[box_index][0],
+                                    bboxes_xywh[box_index][1],
+                                    bboxes_xywh[box_index][2],
+                                    bboxes_xywh[box_index][3],
                                     1,
                                     -1,
                                     -1,
@@ -1388,15 +1400,15 @@ class MainWindow(QtWidgets.QMainWindow):
                                 ]
                             )
                     else:  # start with NO annotation
-                        for l in range(len(bboxes_xywh)):
+                        for box_index in range(len(bboxes_xywh)):
                             lines.append(
                                 [
                                     frame_id,
                                     -1,
-                                    bboxes_xywh[l][0],
-                                    bboxes_xywh[l][1],
-                                    bboxes_xywh[l][2],
-                                    bboxes_xywh[l][3],
+                                    bboxes_xywh[box_index][0],
+                                    bboxes_xywh[box_index][1],
+                                    bboxes_xywh[box_index][2],
+                                    bboxes_xywh[box_index][3],
                                     1,
                                     -1,
                                     -1,
@@ -1413,16 +1425,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     # need boxes in x,y,w,h
                     bboxes_xywh = [convert(bboxes[i]) for i in range(len(bboxes))]
 
-                    # frame_id, track_id, x_top_left, y_top_left, width, height,1,-1,-1,-1
-                    for l in range(len(bboxes_xywh)):
+                    # frame_id, track_id, x, y, width, height, 1, -1, -1, -1
+                    for box_index in range(len(bboxes_xywh)):
                         lines.append(
                             [
                                 frame_id,
                                 -1,
-                                bboxes_xywh[l][0],
-                                bboxes_xywh[l][1],
-                                bboxes_xywh[l][2],
-                                bboxes_xywh[l][3],
+                                bboxes_xywh[box_index][0],
+                                bboxes_xywh[box_index][1],
+                                bboxes_xywh[box_index][2],
+                                bboxes_xywh[box_index][3],
                                 1,
                                 -1,
                                 -1,
@@ -1532,8 +1544,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.interval_INPO = interval = int(
             dialog.interval_cell.text().replace(" ", "")
         )
-        self.ID_INPO = ID = dialog.ID_cell.text().replace(" ", "")
-        self.label_INPO = label = dialog.label_cell.text().replace(" ", "")
+        self.ID_INPO = dialog.ID_cell.text().replace(" ", "")
+        self.label_INPO = dialog.label_cell.text().replace(" ", "")
 
         if end_frame - start_frame <= 0:
             self.errorMessage(
@@ -1758,7 +1770,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.informationMessage(
                 "Box Interpolation",
-                f"Track {self.label_INPO}-{self.ID_INPO} from frame {self.start_INP0} to {self.end_INP0} Interpolation is completed",
+                (
+                    f"Track {self.label_INPO}-{self.ID_INPO} from frame "
+                    f"{self.start_INP0} to {self.end_INP0} "
+                    "Interpolation is completed"
+                ),
             )
 
     def DELETION(self, item=None):
@@ -1844,9 +1860,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Track {label}-{ID} from frame {start_frame} to {end_frame} is deleted"
             )
         elif mode == "Swap ID":
-            msg = f"Track {label}-{ID} swapped to ID {new_ID} from frame {start_frame} to {end_frame}"
+            msg = (
+                f"Track {label}-{ID} swapped to ID {new_ID} from frame "
+                f"{start_frame} to {end_frame}"
+            )
         elif mode == "Swap Label":
-            msg = f"Track {label}-{ID} swapped to label {new_label} from frame {start_frame} to {end_frame}"
+            msg = (
+                f"Track {label}-{ID} swapped to label {new_label} from frame "
+                f"{start_frame} to {end_frame}"
+            )
         self.informationMessage("Track Modification", msg)
 
     def _saveTrackResult(
@@ -2175,6 +2197,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         shape.track_id = id
+        shape.group_id = int(id) if id.isdigit() else id
 
         item.setText(shape.track_id)
         self._update_shape_color(shape)
@@ -2217,6 +2240,8 @@ class MainWindow(QtWidgets.QMainWindow):
         shape.label = text
         shape.flags = flags
         shape.group_id = group_id
+        if group_id is not None:
+            shape.track_id = str(group_id)
         shape.description = description
 
         self._update_shape_color(shape)
@@ -2228,6 +2253,11 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         else:
             item.setText("{} ({})".format(shape.label, shape.group_id))
+        try:
+            id_item = self.IDList.findItemByShape(shape)
+            id_item.setText(str(shape.track_id))
+        except ValueError:
+            pass
         self.setDirty()
         unique_name = shape.label + "_" + str(shape.track_id)
         if self.uniqLabelList.findItemByLabel(unique_name) is None:
@@ -2264,14 +2294,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 getIndex = self.imageList.index(filename) + 1
                 interpolationIndex = self.INTERPOLATION_list.index(self.filename) + 1
                 self.navigation_list.statusBar.showMessage(
-                    f"Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode} - ({interpolationIndex}/{len(self.INTERPOLATION_list)})"
+                    (
+                        f"Status: {getIndex}/{len(self.imageList)} | "
+                        f"Mode: {self.mode} - "
+                        f"({interpolationIndex}/{len(self.INTERPOLATION_list)})"
+                    )
                 )
 
                 self.loadFile(filename)
             else:
                 self.errorMessage(
                     "Box Interpolation",
-                    "You cannot select out-of-list frame. Use Previous (A) and Next (D) buttons to move between the selected frames",
+                    (
+                        "You cannot select out-of-list frame. Use Previous (A) "
+                        "and Next (D) buttons to move between the selected frames"
+                    ),
                 )
                 return
 
@@ -2380,8 +2417,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def remLabels(self, shapes):
         for shape in shapes:
-            item = self.labelList.findItemByShape(shape)
-            self.labelList.removeItem(item)
+            try:
+                item = self.labelList.findItemByShape(shape)
+                self.labelList.removeItem(item)
+            except ValueError:
+                pass
+            try:
+                item = self.IDList.findItemByShape(shape)
+                self.IDList.removeItem(item)
+            except ValueError:
+                pass
 
     def loadShapes(self, shapes, replace=True):
         self._noSelectionSlot = True
@@ -2405,14 +2450,14 @@ class MainWindow(QtWidgets.QMainWindow):
             flags = shape["flags"]
             description = shape.get("description", "")
             group_id = shape["group_id"]
-            track_id = shape["track_id"]
+            track_id = shape.get("track_id") or group_id
 
             if not points:
                 # skip point-empty shape
                 continue
 
             if (
-                self.ir_activated == True
+                self.ir_activated
                 and label == self.ir_name
                 and track_id == self.ir_id
             ):
@@ -2497,7 +2542,16 @@ class MainWindow(QtWidgets.QMainWindow):
             flag = item.checkState() == Qt.Checked
             flags[key] = flag
         try:
-            imagePath = osp.relpath(self.imagePath, osp.dirname(filename))
+            label_dir = osp.dirname(filename)
+            imagePath = osp.abspath(self.imagePath)
+            try:
+                relative_image_path = osp.relpath(imagePath, label_dir)
+            except ValueError:
+                relative_image_path = None
+            if relative_image_path is not None and osp.exists(
+                osp.join(label_dir, relative_image_path)
+            ):
+                imagePath = relative_image_path
             # imageData = self.imageData if self._config["store_data"] else None
             imageData = None
             if osp.dirname(filename) and not osp.exists(osp.dirname(filename)):
@@ -2862,7 +2916,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 prev_shapes, replace=False
             )  # load annotation from prev image
             self.setDirty()
-        elif self.ir_activated == True:
+        elif self.ir_activated:
             self.setDirty()
         else:
             self.setClean()
@@ -3057,7 +3111,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         self.ir_mod_shape = [
                             [p.x(), p.y()] for p in item.shape().points
                         ]
-                if found == False:
+                if not found:
                     self.ir_old_shape = "None"
                     self.ir_mod_shape = "None"
                 self.ir_activated = True

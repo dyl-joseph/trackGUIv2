@@ -1,19 +1,5 @@
-from qtpy import QtGui
 from qtpy import QtWidgets
 from qtpy.QtCore import Qt
-from qtpy import QtCore
-
-from qtpy import QtCore
-from qtpy import QtGui
-from qtpy import QtWidgets
-from qtpy.QtCore import Qt
-from qtpy.QtGui import QPalette
-from qtpy.QtWidgets import QStyle
-
-import labelme.utils
-from labelme.logger import logger
-
-from .. import utils
 
 """
 class NavigationWidget(QtWidgets.QDialogButtonBox):
@@ -70,10 +56,12 @@ class NavigationWidget(QtWidgets.QDialog):
         self.button_box.addButton(self.button2, QtWidgets.QDialogButtonBox.ActionRole)
         self.button3 = QtWidgets.QPushButton("Previous Image (A)")
         self.button_box.addButton(self.button3, QtWidgets.QDialogButtonBox.ActionRole)
-        
+
         self.statusBar = QtWidgets.QStatusBar()
-        self.statusBar.setStyleSheet("border :1px solid black;border-radius: 1px ;text-align: center; ")
-        self.statusBar.showMessage('Status: Not Ready | Mode: None') 
+        self.statusBar.setStyleSheet(
+            "border: 1px solid black; border-radius: 1px; text-align: center;"
+        )
+        self.statusBar.showMessage("Status: Not Ready | Mode: None")
 
         navigationLayout = QtWidgets.QVBoxLayout()
         navigationLayout.addWidget(self.button_box)

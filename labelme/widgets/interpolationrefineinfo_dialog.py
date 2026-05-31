@@ -1,5 +1,6 @@
 from qtpy import QtWidgets
 
+
 class InterpolationRefineInfo_Dialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super(InterpolationRefineInfo_Dialog, self).__init__(parent)

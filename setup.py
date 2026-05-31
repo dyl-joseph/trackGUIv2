@@ -22,18 +22,17 @@ def get_version():
 def get_install_requires():
     install_requires = [
         "gdown",
-        # "imgviz>=1.7.5",
-        # "matplotlib",
-        # "natsort>=7.1.0",
+        "imgviz>=1.7.5",
+        "natsort>=7.1.0",
         "numpy",
         "onnxruntime>=1.14.1,!=1.16.0",
-        # "Pillow>=2.8",
+        "opencv-contrib-python>=4.5",
+        "Pillow>=2.8",
         "PyYAML",
         "qtpy!=1.11.2",
-        # "scikit-image",
+        "scikit-image",
         "termcolor",
         "filterpy",
-        # "opencv-python==4.1.2.30",
         "scipy",
         "scikit-learn",
         "ultralytics>=8.3.0",
@@ -91,7 +90,7 @@ def get_long_description():
 def main():
     version = get_version()
 
-    if sys.argv[1] == "release":
+    if len(sys.argv) > 1 and sys.argv[1] == "release":
         try:
             import github2pypi  # NOQA
         except ImportError:
