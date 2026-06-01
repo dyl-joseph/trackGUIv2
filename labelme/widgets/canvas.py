@@ -146,6 +146,14 @@ class Canvas(QtWidgets.QWidget):
             image=labelme.utils.img_qt_to_arr(self.pixmap.toImage())
         )
 
+    def releaseAiModel(self):
+        if self._ai_model is None:
+            return
+        close = getattr(self._ai_model, "close", None)
+        if close is not None:
+            close()
+        self._ai_model = None
+
     def storeShapes(self):
         shapesBackup = []
         for shape in self.shapes:
@@ -1004,7 +1012,7 @@ class Canvas(QtWidgets.QWidget):
 
     def loadPixmap(self, pixmap, clear_shapes=True):
         self.pixmap = pixmap
-        if self._ai_model:
+        if self._ai_model and self.createMode in ["ai_polygon", "ai_mask"]:
             self._ai_model.set_image(
                 image=labelme.utils.img_qt_to_arr(self.pixmap.toImage())
             )

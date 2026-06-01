@@ -1,9 +1,17 @@
 # flake8: noqa
 
 import logging
+import os
+import os.path as osp
 import sys
+import tempfile
 
 from qtpy import QT_VERSION
+
+if "MPLCONFIGDIR" not in os.environ:
+    mpl_config_dir = osp.join(tempfile.gettempdir(), "labelme-matplotlib")
+    os.makedirs(mpl_config_dir, exist_ok=True)
+    os.environ["MPLCONFIGDIR"] = mpl_config_dir
 
 
 __appname__ = "TrackMe"

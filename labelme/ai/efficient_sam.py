@@ -20,7 +20,21 @@ class EfficientSam:
 
         self._thread = None
 
+    def close(self):
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+        with self._lock:
+            self._image_embedding_cache.clear()
+            self._image = None
+            self._image_embedding = None
+            self._encoder_session = None
+            self._decoder_session = None
+
     def set_image(self, image: np.ndarray):
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
         with self._lock:
             self._image = image
             self._image_embedding = self._image_embedding_cache.get(

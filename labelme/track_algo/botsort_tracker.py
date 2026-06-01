@@ -1,3 +1,17 @@
+import gc
+from pathlib import Path
+
+
+def _resolve_model_path(model_name):
+    model_path = Path(model_name).expanduser()
+    if model_path.is_absolute() or model_path.exists():
+        return str(model_path)
+
+    packaged_model_path = Path(__file__).resolve().parents[1] / "icons" / model_name
+    if packaged_model_path.exists():
+        return str(packaged_model_path)
+
+    return model_name
 
 
 def _compute_iou(box1, box2):
@@ -26,7 +40,7 @@ class BoTSORTForwardTracker:
                 device = "cpu"
 
         self.device = device
-        self.model = YOLO(model_name)
+        self.model = YOLO(_resolve_model_path(model_name))
         self._matched_track_id = None
 
     def init(self, frame, user_bbox_xyxy):
@@ -83,5 +97,17 @@ class BoTSORTForwardTracker:
         return False, None
 
     def reset(self):
-        self.model.predictor = None
+        if self.model is not None:
+            self.model.predictor = None
+            self.model = None
         self._matched_track_id = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+        gc.collect()

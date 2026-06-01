@@ -167,6 +167,62 @@ def test_new_shape_uses_single_prompt_and_auto_track_id(qtbot):
     assert win.IDDialog.history == ["1"]
 
 
+def test_load_image_file_returns_raw_jpeg_when_no_orientation():
+    image_file = osp.join(data_dir, "raw/2011_000003.jpg")
+
+    with open(image_file, "rb") as f:
+        raw = f.read()
+
+    assert LabelFile.load_image_file(image_file) == raw
+
+
+@pytest.mark.gui
+def test_canvas_load_pixmap_does_not_refresh_inactive_ai_model(qtbot):
+    class FakeAiModel:
+        name = "fake"
+
+        def __init__(self):
+            self.images = []
+
+        def set_image(self, image):
+            self.images.append(image)
+
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    ai_model = FakeAiModel()
+    win.canvas._ai_model = ai_model
+    win.canvas.createMode = "polygon"
+
+    pixmap = QtGui.QPixmap(10, 10)
+    pixmap.fill(QtGui.QColor("black"))
+    win.canvas.loadPixmap(pixmap)
+
+    assert ai_model.images == []
+
+
+@pytest.mark.gui
+def test_toggle_draw_mode_releases_ai_model_when_leaving_ai_mode(qtbot):
+    class FakeAiModel:
+        name = "fake"
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    ai_model = FakeAiModel()
+    win.canvas._ai_model = ai_model
+    win.canvas.createMode = "ai_polygon"
+
+    win.toggleDrawMode(True)
+
+    assert ai_model.closed
+    assert win.canvas._ai_model is None
+
+
 @pytest.mark.gui
 def test_track_modification_reject_does_not_change_labels(qtbot, monkeypatch):
     class RejectedDeletionDialog:
@@ -312,6 +368,89 @@ def test_track_modification_swap_id_updates_without_deleting(qtbot, monkeypatch)
             assert data["shapes"][0]["group_id"] == 9
             assert data["shapes"][1]["track_id"] == "8"
             assert data["shapes"][1]["group_id"] == 8
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
+def test_track_modification_swap_id_exchanges_existing_track(qtbot, monkeypatch):
+    class AcceptedSwapIDDialog:
+        def __init__(self, parent=None):
+            self.start_frame_cell = QtWidgets.QLineEdit("1")
+            self.end_frame_cell = QtWidgets.QLineEdit("2")
+            self.ID_cell = QtWidgets.QLineEdit("7")
+            self.label_cell = QtWidgets.QLineEdit("person")
+            self.new_ID_cell = QtWidgets.QLineEdit("9")
+            self.new_label_cell = QtWidgets.QLineEdit("")
+
+        @property
+        def mode(self):
+            return "Swap ID"
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        image_files = [
+            osp.join(tmp_dir, "000001.jpg"),
+            osp.join(tmp_dir, "000002.jpg"),
+        ]
+        for image_file in image_files:
+            shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+
+        old_track = dict(
+            label="person",
+            group_id=7,
+            track_id="7",
+            points=[(10, 10), (20, 20)],
+            shape_type="rectangle",
+            flags={},
+            description=None,
+            mask=None,
+        )
+        existing_new_track = dict(
+            label="person",
+            group_id=9,
+            track_id="9",
+            points=[(30, 30), (40, 40)],
+            shape_type="rectangle",
+            flags={},
+            description=None,
+            mask=None,
+        )
+        for image_file in image_files:
+            LabelFile().save(
+                filename=osp.splitext(image_file)[0] + ".json",
+                shapes=[old_track.copy(), existing_new_track.copy()],
+                imagePath=osp.basename(image_file),
+                imageData=None,
+                imageHeight=10,
+                imageWidth=10,
+                flags={},
+            )
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config)
+        qtbot.addWidget(win)
+        win._imageListCache = image_files
+        win.lastOpenDir = tmp_dir
+        win.image = QtGui.QImage(10, 10, QtGui.QImage.Format_RGB32)
+        win.loadFile = lambda filename=None: None
+        win.informationMessage = lambda title, message: None
+        win.errorMessage = lambda title, message: pytest.fail(message)
+
+        monkeypatch.setattr(labelme.app, "DeletionDialog", AcceptedSwapIDDialog)
+
+        win.DELETION()
+
+        for image_file in image_files:
+            data = json.load(open(osp.splitext(image_file)[0] + ".json"))
+            assert len(data["shapes"]) == 2
+            assert data["shapes"][0]["track_id"] == "9"
+            assert data["shapes"][0]["group_id"] == 9
+            assert data["shapes"][1]["track_id"] == "7"
+            assert data["shapes"][1]["group_id"] == 7
     finally:
         shutil.rmtree(tmp_dir)
 

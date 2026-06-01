@@ -1252,9 +1252,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "ai_polygon": self.actions.createAiPolygonMode,
             "ai_mask": self.actions.createAiMaskMode,
         }
+        ai_modes = {"ai_polygon", "ai_mask"}
+        previous_create_mode = self.canvas.createMode
 
         self.canvas.setEditing(edit)
         self.canvas.createMode = createMode
+        if previous_create_mode in ai_modes and createMode not in ai_modes:
+            self.canvas.releaseAiModel()
         if edit:
             for draw_action in draw_actions.values():
                 draw_action.setEnabled(True)
@@ -1830,6 +1834,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         imageSlice = self.imageList[start_frame - 1 : end_frame]
 
+        def set_shape_track_id(shape, track_id):
+            shape["track_id"] = track_id
+            shape["group_id"] = int(track_id) if track_id.isdigit() else track_id
+
         lf = LabelFile()
         for img_path in imageSlice:
             basename = osp.splitext(osp.basename(img_path))[0] + ".json"
@@ -1850,8 +1858,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 if match and mode == "Remove Box":
                     continue
                 if match and mode == "Swap ID" and new_ID:
-                    s["track_id"] = new_ID
-                    s["group_id"] = int(new_ID) if new_ID.isdigit() else new_ID
+                    set_shape_track_id(s, new_ID)
+                elif (
+                    mode == "Swap ID"
+                    and new_ID
+                    and s["label"] == label
+                    and str(tid) == str(new_ID)
+                ):
+                    set_shape_track_id(s, ID)
                 if match and mode == "Swap Label" and new_label:
                     s["label"] = new_label
                 new_shape.append(s)
@@ -2081,74 +2095,81 @@ class MainWindow(QtWidgets.QMainWindow):
         progress.setValue(curr_index)
         QtWidgets.QApplication.processEvents()
 
-        tracker = BoTSORTForwardTracker(model_name="yolo26x.pt")
-
+        tracker = None
         ai_model = None
-        if use_refine:
-            progress.setLabelText("Loading EfficientSAM...")
-            QtWidgets.QApplication.processEvents()
-            self.canvas.initializeAiModel("EfficientSam (speed)")
-            ai_model = self.canvas._ai_model
-
-        progress.setLabelText("Running YOLO + BoTSORT tracking...")
-
-        if not tracker.init(curr_img, [x1, y1, x2, y2]):
-            progress.close()
-            self.errorMessage(
-                "Track Forward (BoTSORT)",
-                "No YOLO detection matched the selected box (IOU < 0.3).\n"
-                "Ensure the object is clearly visible.",
-            )
-            return
-
         last_tracked = curr_index
-        for i in range(curr_index + 1, end_frame):
-            if progress.wasCanceled():
-                break
-            progress.setValue(i)
-            QtWidgets.QApplication.processEvents()
+        try:
+            tracker = BoTSORTForwardTracker(model_name="yolo26x.pt")
 
-            frame = cv2.imread(self.imageList[i])
-            if frame is None:
-                break
-            success, xyxy = tracker.update(frame)
-            if not success:
-                break
-
-            bx1, by1, bx2, by2 = int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])
-
-            if ai_model is not None and not progress.wasCanceled():
-                rgb_frame = frame[:, :, ::-1]
-                ai_model.set_image(rgb_frame)
+            if use_refine:
+                progress.setLabelText("Loading EfficientSAM...")
                 QtWidgets.QApplication.processEvents()
-                if not progress.wasCanceled():
-                    mask = ai_model.predict_mask_from_box([bx1, by1, bx2, by2])
-                    if mask is not None and mask.any():
-                        ys, xs = np.where(mask)
-                        bx1, by1, bx2, by2 = (
-                            int(xs.min()),
-                            int(ys.min()),
-                            int(xs.max()),
-                            int(ys.max()),
-                        )
+                self.canvas.initializeAiModel("EfficientSam (speed)")
+                ai_model = self.canvas._ai_model
 
-            if progress.wasCanceled():
-                break
+            progress.setLabelText("Running YOLO + BoTSORT tracking...")
 
-            self._saveTrackResult(
-                self.imageList[i],
-                label,
-                track_id,
-                group_id,
-                [[bx1, by1], [bx2, by2]],
-                curr_img.shape,
-            )
-            last_tracked = i
+            if not tracker.init(curr_img, [x1, y1, x2, y2]):
+                self.errorMessage(
+                    "Track Forward (BoTSORT)",
+                    "No YOLO detection matched the selected box (IOU < 0.3).\n"
+                    "Ensure the object is clearly visible.",
+                )
+                return
 
-        progress.close()
-        tracker.reset()
-        if ai_model is not None:
-            self.canvas._ai_model = None
+            for i in range(curr_index + 1, end_frame):
+                if progress.wasCanceled():
+                    break
+                progress.setValue(i)
+                QtWidgets.QApplication.processEvents()
+
+                frame = cv2.imread(self.imageList[i])
+                if frame is None:
+                    break
+                success, xyxy = tracker.update(frame)
+                if not success:
+                    break
+
+                bx1, by1, bx2, by2 = (
+                    int(xyxy[0]),
+                    int(xyxy[1]),
+                    int(xyxy[2]),
+                    int(xyxy[3]),
+                )
+
+                if ai_model is not None and not progress.wasCanceled():
+                    rgb_frame = frame[:, :, ::-1]
+                    ai_model.set_image(rgb_frame)
+                    QtWidgets.QApplication.processEvents()
+                    if not progress.wasCanceled():
+                        mask = ai_model.predict_mask_from_box([bx1, by1, bx2, by2])
+                        if mask is not None and mask.any():
+                            ys, xs = np.where(mask)
+                            bx1, by1, bx2, by2 = (
+                                int(xs.min()),
+                                int(ys.min()),
+                                int(xs.max()),
+                                int(ys.max()),
+                            )
+
+                if progress.wasCanceled():
+                    break
+
+                self._saveTrackResult(
+                    self.imageList[i],
+                    label,
+                    track_id,
+                    group_id,
+                    [[bx1, by1], [bx2, by2]],
+                    curr_img.shape,
+                )
+                last_tracked = i
+        finally:
+            progress.close()
+            if tracker is not None:
+                tracker.reset()
+            if ai_model is not None:
+                self.canvas.releaseAiModel()
         tracked_count = last_tracked - curr_index
         self.loadFile(self.filename)
         self.informationMessage(
@@ -2188,7 +2209,7 @@ class MainWindow(QtWidgets.QMainWindow):
             shape.points[0] = QtCore.QPointF(float(xs.min()), float(ys.min()))
             shape.points[1] = QtCore.QPointF(float(xs.max()), float(ys.max()))
 
-        self.canvas._ai_model = None
+        self.canvas.releaseAiModel()
         self.canvas.update()
         self.setDirty()
 
@@ -2837,7 +2858,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fileListWidget.currentRow() != self.imageList.index(filename)
         ):
             self.fileListWidget.setCurrentRow(self.imageList.index(filename))
-            self.fileListWidget.repaint()
             return
 
         self.resetState()

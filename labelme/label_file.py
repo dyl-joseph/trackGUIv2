@@ -44,6 +44,38 @@ class LabelFile(object):
 
     @staticmethod
     def load_image_file(filename):
+        if not (PY2 and QT4):
+            try:
+                with io.open(filename, "rb") as f:
+                    image_data = f.read()
+            except IOError:
+                logger.error("Failed opening image file: {}".format(filename))
+                return
+
+            ext = osp.splitext(filename)[1].lower()
+            if ext in [".jpg", ".jpeg"]:
+                try:
+                    image_pil = PIL.Image.open(io.BytesIO(image_data))
+                except IOError:
+                    logger.error("Failed opening image file: {}".format(filename))
+                    return
+                orientation = image_pil.getexif().get(274)
+                if not orientation or orientation == 1:
+                    return image_data
+            elif ext in [
+                ".bmp",
+                ".gif",
+                ".ico",
+                ".png",
+                ".pbm",
+                ".pgm",
+                ".ppm",
+                ".tif",
+                ".tiff",
+                ".webp",
+            ]:
+                return image_data
+
         try:
             image_pil = PIL.Image.open(filename)
         except IOError:
