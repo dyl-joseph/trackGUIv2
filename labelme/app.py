@@ -1808,6 +1808,25 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = dialog.mode
         new_ID = dialog.new_ID_cell.text().replace(" ", "")
         new_label = dialog.new_label_cell.text().replace(" ", "")
+        if mode == "Swap ID" and not new_ID:
+            self.errorMessage(
+                "Track Modification",
+                "New ID is required when swapping IDs.",
+            )
+            return
+        if mode == "Swap Label" and not new_label:
+            self.errorMessage(
+                "Track Modification",
+                "New label is required when swapping labels.",
+            )
+            return
+        if mode == "Remove Box" and (new_ID or new_label):
+            self.errorMessage(
+                "Track Modification",
+                "Remove Box deletes matching boxes. Choose Swap ID or Swap Label "
+                "to apply the new value.",
+            )
+            return
 
         imageSlice = self.imageList[start_frame - 1 : end_frame]
 

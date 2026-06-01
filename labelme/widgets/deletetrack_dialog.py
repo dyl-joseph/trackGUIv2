@@ -16,6 +16,7 @@ class DeletionDialog(QtWidgets.QDialog):
 
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(["Remove Box", "Swap Label", "Swap ID"])
+        self.mode_combo.setCurrentText("Swap ID")
 
         self.button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
