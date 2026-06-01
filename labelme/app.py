@@ -1142,6 +1142,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.filename:
             self.saveLabels(self._resolveJsonPath())
 
+    def _flushPendingAutoSave(self):
+        save_timer = getattr(self, "_save_timer", None)
+        if save_timer is not None and save_timer.isActive():
+            save_timer.stop()
+            self._debouncedSave()
+
     def setClean(self):
         self.dirty = False
         self.actions.save.setEnabled(False)
@@ -2850,9 +2856,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def loadFile(self, filename=None):
         """Load the specified file, or the last opened file if None."""
-        if self._save_timer.isActive():
-            self._save_timer.stop()
-            self._debouncedSave()
+        self._flushPendingAutoSave()
         # changing fileListWidget loads file
         if filename in self.imageList and (
             self.fileListWidget.currentRow() != self.imageList.index(filename)
@@ -3096,6 +3100,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(self.imageList) <= 0:
             return
 
+        self._flushPendingAutoSave()
+
         if self.mode == "NORMAL" or self.mode == "None":
             self.ir_activated = False
             if self.filename is None:
@@ -3129,6 +3135,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if len(self.imageList) <= 0:
             return
+
+        self._flushPendingAutoSave()
 
         if self.mode == "NORMAL" or self.mode == "None":
             if (
