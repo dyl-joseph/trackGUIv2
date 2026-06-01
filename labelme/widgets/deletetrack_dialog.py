@@ -17,8 +17,11 @@ class DeletionDialog(QtWidgets.QDialog):
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(["Remove Box", "Swap Label", "Swap ID"])
 
-        self.button = QtWidgets.QPushButton("Finish")
-        self.button.clicked.connect(self.accept)
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
 
         layout = QtWidgets.QFormLayout()
         layout.addRow("Start Frame:", self.start_frame_cell)
@@ -28,7 +31,7 @@ class DeletionDialog(QtWidgets.QDialog):
         layout.addRow("New ID:", self.new_ID_cell)
         layout.addRow("New Label:", self.new_label_cell)
         layout.addRow("Mode:", self.mode_combo)
-        layout.addWidget(self.button)
+        layout.addWidget(self.button_box)
         self.setLayout(layout)
 
     @property

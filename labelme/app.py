@@ -1781,7 +1781,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = DeletionDialog(
             parent=self,
         )
-        dialog.exec_()
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
 
         if (
             dialog.start_frame_cell.text() == ""

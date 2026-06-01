@@ -1,14 +1,17 @@
+import json
 import os.path as osp
 import shutil
 import tempfile
 
 import pytest
 from qtpy import QtCore
+from qtpy import QtGui
 from qtpy import QtWidgets
 
 import labelme.app
 import labelme.config
 import labelme.testing
+from labelme.label_file import LabelFile
 from labelme.shape import Shape
 
 here = osp.dirname(osp.abspath(__file__))
@@ -162,3 +165,68 @@ def test_new_shape_uses_single_prompt_and_auto_track_id(qtbot):
     assert shape.label == "person"
     assert shape.track_id == "1"
     assert win.IDDialog.history == ["1"]
+
+
+@pytest.mark.gui
+def test_track_modification_reject_does_not_change_labels(qtbot, monkeypatch):
+    class RejectedDeletionDialog:
+        def __init__(self, parent=None):
+            self.start_frame_cell = QtWidgets.QLineEdit("1")
+            self.end_frame_cell = QtWidgets.QLineEdit("2")
+            self.ID_cell = QtWidgets.QLineEdit("7")
+            self.label_cell = QtWidgets.QLineEdit("person")
+            self.new_ID_cell = QtWidgets.QLineEdit("")
+            self.new_label_cell = QtWidgets.QLineEdit("")
+
+        @property
+        def mode(self):
+            return "Remove Box"
+
+        def exec_(self):
+            return QtWidgets.QDialog.Rejected
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        image_file = osp.join(tmp_dir, "000001.jpg")
+        image_file_2 = osp.join(tmp_dir, "000002.jpg")
+        shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+        shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file_2)
+
+        shape = dict(
+            label="person",
+            group_id=7,
+            track_id="7",
+            points=[(10, 10), (20, 20)],
+            shape_type="rectangle",
+            flags={},
+            description=None,
+            mask=None,
+        )
+        for image_path in [image_file, image_file_2]:
+            LabelFile().save(
+                filename=osp.splitext(image_path)[0] + ".json",
+                shapes=[shape.copy()],
+                imagePath=osp.basename(image_path),
+                imageData=None,
+                imageHeight=10,
+                imageWidth=10,
+                flags={},
+            )
+
+        before = json.load(open(osp.splitext(image_file)[0] + ".json"))
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config)
+        qtbot.addWidget(win)
+        win._imageListCache = [image_file, image_file_2]
+        win.lastOpenDir = tmp_dir
+        win.image = QtGui.QImage(10, 10, QtGui.QImage.Format_RGB32)
+
+        monkeypatch.setattr(labelme.app, "DeletionDialog", RejectedDeletionDialog)
+
+        win.DELETION()
+
+        after = json.load(open(osp.splitext(image_file)[0] + ".json"))
+        assert after == before
+    finally:
+        shutil.rmtree(tmp_dir)
