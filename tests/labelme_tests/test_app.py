@@ -68,6 +68,22 @@ def create_MainWindow_with_directory(qtbot):
     return win
 
 
+def _copy_test_image_sequence(tmp_dir):
+    input_file = osp.join(data_dir, "raw/2011_000003.jpg")
+    image_files = [
+        osp.join(tmp_dir, "000001.jpg"),
+        osp.join(tmp_dir, "000002.jpg"),
+    ]
+    for image_file in image_files:
+        shutil.copy(input_file, image_file)
+    return image_files
+
+
+def _read_json(filename):
+    with open(filename) as f:
+        return json.load(f)
+
+
 @pytest.mark.gui
 def test_MainWindow_openNextImg(qtbot):
     win = create_MainWindow_with_directory(qtbot)
@@ -78,6 +94,99 @@ def test_MainWindow_openNextImg(qtbot):
 def test_MainWindow_openPrevImg(qtbot):
     win = create_MainWindow_with_directory(qtbot)
     win.openNextImg()
+
+
+@pytest.mark.gui
+def test_pending_autosave_new_bbox_stays_on_current_frame_when_opening_next(qtbot):
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        image_files = _copy_test_image_sequence(tmp_dir)
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config, filename=tmp_dir)
+        qtbot.addWidget(win)
+        _win_show_and_wait_imageData(qtbot, win)
+        assert win.filename == image_files[0]
+
+        shape = Shape(
+            label="person",
+            group_id=1,
+            track_id="1",
+            shape_type="rectangle",
+            flags={},
+        )
+        shape.addPoint(QtCore.QPointF(10, 10))
+        shape.addPoint(QtCore.QPointF(20, 20))
+        shape.close()
+        win.loadShapes([shape])
+        win.setDirty()
+
+        assert win._save_timer.isActive()
+
+        win.openNextImg()
+
+        first_json = osp.splitext(image_files[0])[0] + ".json"
+        second_json = osp.splitext(image_files[1])[0] + ".json"
+        data = _read_json(first_json)
+
+        assert data["imagePath"] == "000001.jpg"
+        assert data["shapes"][0]["points"] == [[10.0, 10.0], [20.0, 20.0]]
+        assert not osp.exists(second_json)
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
+def test_keyboard_bbox_move_autosaves_before_frame_change(qtbot):
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        image_files = _copy_test_image_sequence(tmp_dir)
+        shape = dict(
+            label="person",
+            group_id=1,
+            track_id="1",
+            points=[(10, 10), (20, 20)],
+            shape_type="rectangle",
+            flags={},
+            description=None,
+            mask=None,
+        )
+        for image_file in image_files:
+            LabelFile().save(
+                filename=osp.splitext(image_file)[0] + ".json",
+                shapes=[shape.copy()],
+                imagePath=osp.basename(image_file),
+                imageData=None,
+                imageHeight=10,
+                imageWidth=10,
+                flags={},
+            )
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config, filename=tmp_dir)
+        qtbot.addWidget(win)
+        _win_show_and_wait_imageData(qtbot, win)
+        assert win.filename == image_files[0]
+
+        shape_obj = win.canvas.shapes[0]
+        win.canvas.selectedShapes = [shape_obj]
+        win.canvas.prevPoint = QtCore.QPointF(shape_obj.points[0])
+        win.canvas.calculateOffsets(win.canvas.prevPoint)
+        win.canvas.moveByKeyboard(QtCore.QPointF(1.0, 0.0))
+
+        assert win._save_timer.isActive()
+
+        win.openNextImg()
+        win.openPrevImg()
+
+        data = _read_json(osp.splitext(image_files[0])[0] + ".json")
+        assert data["shapes"][0]["points"] == [[11.0, 10.0], [21.0, 20.0]]
+        assert [(p.x(), p.y()) for p in win.canvas.shapes[0].points] == [
+            (11.0, 10.0),
+            (21.0, 20.0),
+        ]
+    finally:
+        shutil.rmtree(tmp_dir)
 
 
 @pytest.mark.gui
