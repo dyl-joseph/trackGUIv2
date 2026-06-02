@@ -1,6 +1,6 @@
 /.cache/
 /.pytest_cache/
-
+*yolo26x.pt
 /build/
 /dist/
 /*.egg-info/
