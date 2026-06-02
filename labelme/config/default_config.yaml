@@ -6,6 +6,7 @@ keep_prev_scale: false
 keep_prev_brightness: false
 keep_prev_contrast: false
 logger_level: info
+theme: system
 
 flags: null
 label_flags: null
@@ -292,6 +293,13 @@ shape:
 ai:
   default: 'EfficientSam (accuracy)'
 
+hosted_sam2:
+  url: null
+  api_token: null
+  timeout_seconds: 30
+  cache_frames: true
+  verify_tls: true
+
 # main
 flag_dock:
   show: true
@@ -382,4 +390,3 @@ shortcuts:
   show_all_polygons: null
   hide_all_polygons: null
   toggle_all_polygons: T
-

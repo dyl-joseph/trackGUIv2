@@ -30,6 +30,8 @@ class Canvas(QtWidgets.QWidget):
     shapeMoved = QtCore.Signal()
     drawingPolygon = QtCore.Signal(bool)
     vertexSelected = QtCore.Signal(bool)
+    pointPromptRequested = QtCore.Signal(QtCore.QPointF)
+    pointPromptCancelled = QtCore.Signal()
 
     CREATE, EDIT = 0, 1
 
@@ -92,6 +94,7 @@ class Canvas(QtWidgets.QWidget):
         self.hShapeIsSelected = False
         self._painter = QtGui.QPainter()
         self._cursor = CURSOR_DEFAULT
+        self._point_prompt_armed = False
         # Menus:
         # 0: right-click without selection and dragging of shapes
         # 1: right-click with selection and dragging of shapes
@@ -217,6 +220,31 @@ class Canvas(QtWidgets.QWidget):
             self.unHighlight()
             self.deSelectShape()
 
+    def armPointPrompt(self):
+        if not self.pixmap:
+            return False
+        if self.current:
+            self.current = None
+            self.drawingPolygon.emit(False)
+        self._point_prompt_armed = True
+        self.unHighlight()
+        self.overrideCursor(CURSOR_POINT)
+        self.setToolTip(self.tr("Click an object for SAM2 point prompt"))
+        self.setStatusTip(self.toolTip())
+        self.update()
+        return True
+
+    def cancelPointPrompt(self, emit_signal=True):
+        if not self._point_prompt_armed:
+            return False
+        self._point_prompt_armed = False
+        self.restoreCursor()
+        self.setToolTip(self.tr("Image"))
+        if emit_signal:
+            self.pointPromptCancelled.emit()
+        self.update()
+        return True
+
     def unHighlight(self):
         if self.hShape:
             self.hShape.highlightClear()
@@ -244,6 +272,14 @@ class Canvas(QtWidgets.QWidget):
 
         self.prevMovePoint = pos
         self.restoreCursor()
+
+        if self._point_prompt_armed:
+            self.setToolTip(self.tr("Click an object for SAM2 point prompt"))
+            self.setStatusTip(self.toolTip())
+            if not self.outOfPixmap(pos):
+                self.overrideCursor(CURSOR_POINT)
+            self.unHighlight()
+            return
 
         is_shift_pressed = ev.modifiers() & QtCore.Qt.ShiftModifier
 
@@ -415,6 +451,13 @@ class Canvas(QtWidgets.QWidget):
         is_shift_pressed = ev.modifiers() & QtCore.Qt.ShiftModifier
 
         if ev.button() == QtCore.Qt.LeftButton:
+            if self._point_prompt_armed:
+                if not self.outOfPixmap(pos):
+                    self._point_prompt_armed = False
+                    self.restoreCursor()
+                    self.pointPromptRequested.emit(QtCore.QPointF(pos))
+                    self.update()
+                return
             if self.drawing():
                 if self.current:
                     # Add point to existing shape.
@@ -954,6 +997,10 @@ class Canvas(QtWidgets.QWidget):
     def keyPressEvent(self, ev):
         modifiers = ev.modifiers()
         key = ev.key()
+        if self._point_prompt_armed:
+            if key == QtCore.Qt.Key_Escape:
+                self.cancelPointPrompt()
+            return
         if self.drawing():
             if key == QtCore.Qt.Key_Escape and self.current:
                 self.current = None
@@ -1012,6 +1059,7 @@ class Canvas(QtWidgets.QWidget):
         self.update()
 
     def loadPixmap(self, pixmap, clear_shapes=True):
+        self.cancelPointPrompt(emit_signal=False)
         self.pixmap = pixmap
         if self._ai_model and self.createMode in ["ai_polygon", "ai_mask"]:
             self._ai_model.set_image(
@@ -1047,6 +1095,7 @@ class Canvas(QtWidgets.QWidget):
         QtWidgets.QApplication.restoreOverrideCursor()
 
     def resetState(self):
+        self.cancelPointPrompt(emit_signal=False)
         self.restoreCursor()
         self.pixmap = None
         self.shapesBackups = []

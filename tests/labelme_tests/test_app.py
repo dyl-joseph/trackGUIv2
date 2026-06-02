@@ -11,8 +11,10 @@ from qtpy import QtWidgets
 import labelme.app
 import labelme.config
 import labelme.testing
+from labelme.hosted_sam2_client import HostedSam2Error
 from labelme.label_file import LabelFile
 from labelme.shape import Shape
+from labelme.widgets import Canvas
 
 here = osp.dirname(osp.abspath(__file__))
 data_dir = osp.join(here, "data")
@@ -82,6 +84,60 @@ def _copy_test_image_sequence(tmp_dir):
 def _read_json(filename):
     with open(filename) as f:
         return json.load(f)
+
+
+class FakeHostedSam2Client:
+    def __init__(self, bbox=None, fail_prompt=False):
+        self.bbox = bbox or [12.0, 14.0, 40.0, 45.0]
+        self.fail_prompt = fail_prompt
+        self.register_calls = []
+        self.prompt_calls = []
+
+    def is_configured(self):
+        return True
+
+    def register_image(self, image_data, client_frame_key=None):
+        self.register_calls.append((image_data, client_frame_key))
+        image = QtGui.QImage.fromData(image_data)
+        return {
+            "image_id": "fake-image-id",
+            "width": image.width(),
+            "height": image.height(),
+            "prepared": True,
+        }
+
+    def point_prompt(self, image_id, x, y, label=1):
+        self.prompt_calls.append((image_id, x, y, label))
+        if self.fail_prompt:
+            raise HostedSam2Error("prompt failed")
+        return {"bbox": list(self.bbox), "score": 0.9, "model": "fake-sam2"}
+
+
+class FakeLabelDialog:
+    def __init__(self, label="person"):
+        self.edit = QtWidgets.QLineEdit()
+        self.label = label
+        self.popups = 0
+        self.history = []
+
+    def popUp(self, text=None):
+        self.popups += 1
+        return self.label, {}, None, ""
+
+    def addLabelHistory(self, label):
+        self.history.append(label)
+
+
+class FailingIDDialog:
+    def __init__(self):
+        self.edit = QtWidgets.QLineEdit()
+        self.history = []
+
+    def popUp(self, text=None):
+        raise AssertionError("new SAM2 bbox should not open the ID dialog")
+
+    def addIDHistory(self, track_id):
+        self.history.append(track_id)
 
 
 @pytest.mark.gui
@@ -274,6 +330,107 @@ def test_new_shape_uses_single_prompt_and_auto_track_id(qtbot):
     assert shape.label == "person"
     assert shape.track_id == "1"
     assert win.IDDialog.history == ["1"]
+
+
+@pytest.mark.gui
+def test_canvas_point_prompt_emits_image_coordinates(qtbot):
+    canvas = Canvas()
+    qtbot.addWidget(canvas)
+    pixmap = QtGui.QPixmap(100, 80)
+    pixmap.fill(QtGui.QColor("black"))
+    canvas.resize(100, 80)
+    canvas.loadPixmap(pixmap)
+    points = []
+    canvas.pointPromptRequested.connect(points.append)
+
+    assert canvas.armPointPrompt()
+    event = QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonPress,
+        QtCore.QPointF(10, 15),
+        QtCore.Qt.LeftButton,
+        QtCore.Qt.LeftButton,
+        QtCore.Qt.NoModifier,
+    )
+    canvas.mousePressEvent(event)
+
+    assert len(points) == 1
+    assert points[0].x() == 10
+    assert points[0].y() == 15
+
+
+@pytest.mark.gui
+def test_hosted_sam2_point_prompt_adds_bbox_with_existing_popup(qtbot):
+    img_file = osp.join(data_dir, "raw/2011_000003.jpg")
+    config = labelme.config.get_default_config()
+    config["hosted_sam2"]["url"] = "http://sam2.example"
+    win = labelme.app.MainWindow(config=config, filename=img_file)
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    fake_client = FakeHostedSam2Client(bbox=[12, 14, 40, 45])
+    win._hosted_sam2_client = fake_client
+    win.labelDialog = FakeLabelDialog()
+    win.IDDialog = FailingIDDialog()
+
+    win.startHostedSam2PointPrompt()
+
+    qtbot.waitUntil(lambda: len(fake_client.register_calls) == 1)
+    assert win.canvas._point_prompt_armed
+    win.canvas.pointPromptRequested.emit(QtCore.QPointF(20, 25))
+    qtbot.waitUntil(lambda: len(fake_client.prompt_calls) == 1)
+    qtbot.waitUntil(lambda: len(win.canvas.shapes) == 1)
+
+    shape = win.canvas.shapes[0]
+    assert shape.label == "person"
+    assert shape.track_id == "1"
+    assert [(p.x(), p.y()) for p in shape.points] == [(12.0, 14.0), (40.0, 45.0)]
+    assert win.labelDialog.popups == 1
+    assert win.IDDialog.history == ["1"]
+    assert win._save_timer.isActive()
+
+
+@pytest.mark.gui
+def test_hosted_sam2_popup_cancel_creates_no_bbox(qtbot):
+    img_file = osp.join(data_dir, "raw/2011_000003.jpg")
+    config = labelme.config.get_default_config()
+    config["hosted_sam2"]["url"] = "http://sam2.example"
+    win = labelme.app.MainWindow(config=config, filename=img_file)
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    fake_client = FakeHostedSam2Client()
+    win._hosted_sam2_client = fake_client
+    win.labelDialog = FakeLabelDialog(label="")
+    win.IDDialog = FailingIDDialog()
+
+    win.startHostedSam2PointPrompt()
+    qtbot.waitUntil(lambda: len(fake_client.register_calls) == 1)
+    win.canvas.pointPromptRequested.emit(QtCore.QPointF(20, 25))
+    qtbot.waitUntil(lambda: len(fake_client.prompt_calls) == 1)
+    qtbot.waitUntil(lambda: win.labelDialog.popups == 1)
+
+    assert win.canvas.shapes == []
+    assert win.labelDialog.popups == 1
+
+
+@pytest.mark.gui
+def test_hosted_sam2_prompt_failure_creates_no_bbox(qtbot):
+    img_file = osp.join(data_dir, "raw/2011_000003.jpg")
+    config = labelme.config.get_default_config()
+    config["hosted_sam2"]["url"] = "http://sam2.example"
+    win = labelme.app.MainWindow(config=config, filename=img_file)
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    fake_client = FakeHostedSam2Client(fail_prompt=True)
+    win._hosted_sam2_client = fake_client
+    errors = []
+    win.errorMessage = lambda title, message: errors.append((title, message))
+
+    win.startHostedSam2PointPrompt()
+    qtbot.waitUntil(lambda: len(fake_client.register_calls) == 1)
+    win.canvas.pointPromptRequested.emit(QtCore.QPointF(20, 25))
+    qtbot.waitUntil(lambda: bool(errors))
+
+    assert errors == [("Hosted SAM2", "prompt failed")]
+    assert win.canvas.shapes == []
 
 
 def test_load_image_file_returns_raw_jpeg_when_no_orientation():

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import functools
+import hashlib
 import html
 import json
 import math
@@ -23,6 +24,8 @@ from labelme import PY2
 from labelme import __appname__
 from labelme.ai import MODELS
 from labelme.config import get_config
+from labelme.hosted_sam2_client import HostedSam2Client
+from labelme.hosted_sam2_client import HostedSam2Error
 from labelme.label_file import LabelFile
 from labelme.label_file import LabelFileError
 from labelme.logger import logger
@@ -60,8 +63,30 @@ from . import utils
 LABEL_COLORMAP = imgviz.label_colormap()
 
 
+class HostedSam2RequestWorker(QtCore.QObject):
+    finished = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, function, *args, **kwargs):
+        super().__init__()
+        self._function = function
+        self._args = args
+        self._kwargs = kwargs
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            self.finished.emit(self._function(*self._args, **self._kwargs))
+        except HostedSam2Error as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Hosted SAM2 request failed")
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QtWidgets.QMainWindow):
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = 0, 1, 2
+    THEME_SYSTEM, THEME_LIGHT, THEME_DARK = "system", "light", "dark"
 
     def __init__(
         self,
@@ -112,6 +137,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._noSelectionSlot = False
 
         self._copied_shapes = None
+        self._hosted_sam2_client = HostedSam2Client.from_config(self._config)
+        self._hosted_sam2_image_cache = {}
+        self._hosted_sam2_thread = None
+        self._hosted_sam2_worker = None
+        self._hosted_sam2_request_active = False
 
         # Main widgets and related state.
         self.labelDialog = LabelDialog(
@@ -249,6 +279,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.shapeMoved.connect(self.setDirty)
         self.canvas.selectionChanged.connect(self.shapeSelectionChanged)
         self.canvas.drawingPolygon.connect(self.toggleDrawingSensitive)
+        self.canvas.pointPromptRequested.connect(self._hostedSam2PointPrompt)
+        self.canvas.pointPromptCancelled.connect(self._hostedSam2PointPromptCancelled)
+
+        self._theme_mode = self._config.get("theme", self.THEME_SYSTEM)
+        self._theme_action_group = QtWidgets.QActionGroup(self)
+        self._theme_action_group.setExclusive(True)
 
         self.setCentralWidget(scrollArea)
 
@@ -643,6 +679,23 @@ class MainWindow(QtWidgets.QMainWindow):
             "Adjust brightness and contrast",
             enabled=False,
         )
+        themeSystem = action(
+            self.tr("&System Theme"),
+            functools.partial(self.setThemeMode, self.THEME_SYSTEM),
+            checkable=True,
+        )
+        themeLight = action(
+            self.tr("&Light Theme"),
+            functools.partial(self.setThemeMode, self.THEME_LIGHT),
+            checkable=True,
+        )
+        themeDark = action(
+            self.tr("&Dark Theme"),
+            functools.partial(self.setThemeMode, self.THEME_DARK),
+            checkable=True,
+        )
+        for theme_action in (themeSystem, themeLight, themeDark):
+            self._theme_action_group.addAction(theme_action)
         # Group zoom controls into a list for easier toggling.
         zoomActions = (
             self.zoomWidget,
@@ -733,6 +786,15 @@ class MainWindow(QtWidgets.QMainWindow):
             enabled=False,
         )
 
+        hosted_sam2_point_prompt = action(
+            self.tr("&Point Prompt (SAM2)"),
+            self.startHostedSam2PointPrompt,
+            "Shift+P",
+            "edit",
+            self.tr("Create a bbox from a hosted SAM2 point prompt"),
+            enabled=False,
+        )
+
         hideSelected = action(
             self.tr("&Hide Selected"),
             self.hideSelectedShape,
@@ -785,6 +847,7 @@ class MainWindow(QtWidgets.QMainWindow):
             trackForward=call_track_forward,
             trackForwardBoTSORT=call_track_forward_botsort,
             refineBboxAI=refine_bbox_ai,
+            hostedSam2PointPrompt=hosted_sam2_point_prompt,
             duplicate=duplicate,
             copy=copy,
             paste=paste,
@@ -808,6 +871,9 @@ class MainWindow(QtWidgets.QMainWindow):
             fitWindow=fitWindow,
             fitWidth=fitWidth,
             brightnessContrast=brightnessContrast,
+            themeSystem=themeSystem,
+            themeLight=themeLight,
+            themeDark=themeDark,
             zoomActions=zoomActions,
             openNextImg=openNextImg,
             openPrevImg=openPrevImg,
@@ -862,6 +928,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 createAiMaskMode,
                 editMode,
                 brightnessContrast,
+                hosted_sam2_point_prompt,
             ),
             onShapesPresent=(saveAs, hideAll, showAll, toggleAll, hideSelected),
         )
@@ -907,6 +974,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.shape_dock.toggleViewAction(),
                 self.file_dock.toggleViewAction(),
                 None,
+                themeSystem,
+                themeLight,
+                themeDark,
+                None,
                 fill_drawing,
                 None,
                 hideAll,
@@ -925,6 +996,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 brightnessContrast,
             ),
         )
+
+        self._syncThemeActions()
+        self.applyTheme(self._theme_mode)
         utils.addActions(
             self.menus.track,
             (
@@ -934,6 +1008,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 call_track_forward,
                 call_track_forward_botsort,
                 refine_bbox_ai,
+                hosted_sam2_point_prompt,
             ),
         )
 
@@ -1116,6 +1191,46 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         utils.addActions(self.menus.edit, actions + self.actions.editMenu)
 
+    def _syncThemeActions(self):
+        theme = self._theme_mode
+        self.actions.themeSystem.setChecked(theme == self.THEME_SYSTEM)
+        self.actions.themeLight.setChecked(theme == self.THEME_LIGHT)
+        self.actions.themeDark.setChecked(theme == self.THEME_DARK)
+
+    def setThemeMode(self, theme_mode):
+        self._theme_mode = theme_mode
+        self._config["theme"] = theme_mode
+        self._syncThemeActions()
+        self.applyTheme(theme_mode)
+
+    def applyTheme(self, theme_mode):
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return
+        if theme_mode == self.THEME_SYSTEM:
+            app.setPalette(app.style().standardPalette())
+            app.setStyleSheet("")
+            return
+
+        palette = QtGui.QPalette()
+        if theme_mode == self.THEME_DARK:
+            palette.setColor(QtGui.QPalette.Window, QtGui.QColor(45, 45, 45))
+            palette.setColor(QtGui.QPalette.WindowText, QtCore.Qt.white)
+            palette.setColor(QtGui.QPalette.Base, QtGui.QColor(30, 30, 30))
+            palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(45, 45, 45))
+            palette.setColor(QtGui.QPalette.ToolTipBase, QtCore.Qt.white)
+            palette.setColor(QtGui.QPalette.ToolTipText, QtCore.Qt.white)
+            palette.setColor(QtGui.QPalette.Text, QtCore.Qt.white)
+            palette.setColor(QtGui.QPalette.Button, QtGui.QColor(45, 45, 45))
+            palette.setColor(QtGui.QPalette.ButtonText, QtCore.Qt.white)
+            palette.setColor(QtGui.QPalette.BrightText, QtCore.Qt.red)
+            palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(42, 130, 218))
+            palette.setColor(QtGui.QPalette.HighlightedText, QtCore.Qt.black)
+        else:
+            palette = app.style().standardPalette()
+        app.setPalette(palette)
+        app.setStyleSheet("")
+
     def _resolveJsonPath(self):
         if self.labelFile and self.labelFile.filename:
             return self.labelFile.filename
@@ -1165,6 +1280,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.trackForward.setEnabled(True)
         self.actions.trackForwardBoTSORT.setEnabled(True)
         self.actions.refineBboxAI.setEnabled(True)
+        self.actions.hostedSam2PointPrompt.setEnabled(True)
         title = __appname__
         if self.filename is not None:
             title = "{} - {}".format(title, self.filename)
@@ -2219,6 +2335,177 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.update()
         self.setDirty()
 
+    def startHostedSam2PointPrompt(self):
+        if not self._hosted_sam2_client.is_configured():
+            self.errorMessage(
+                "Hosted SAM2",
+                "Set hosted_sam2.url in the config or "
+                "LABELME_HOSTED_SAM2_URL in the environment.",
+            )
+            return
+        if self.image.isNull() or self.imageData is None:
+            self.errorMessage("Hosted SAM2", "Open an image before point prompting.")
+            return
+        if self._hosted_sam2_request_active:
+            self.status("Hosted SAM2 request already in progress.")
+            return
+
+        self.setEditMode()
+        self.canvas.cancelPointPrompt(emit_signal=False)
+        frame_key = self._hostedSam2FrameKey()
+        cached_image = self._hosted_sam2_image_cache.get(frame_key)
+        if cached_image is not None:
+            self._armHostedSam2PointPrompt()
+            return
+
+        self.status("Registering current frame with hosted SAM2...")
+        self._runHostedSam2Request(
+            self._hosted_sam2_client.register_image,
+            self._hostedSam2ImageRegistered,
+            self.imageData,
+            client_frame_key=frame_key,
+            _context={"frame_key": frame_key},
+        )
+
+    def _hostedSam2FrameKey(self):
+        if self.imageData is None:
+            return None
+        image_hash = hashlib.sha256(self.imageData).hexdigest()
+        image_path = self.imagePath or self.filename or ""
+        return "{}:{}x{}:{}".format(
+            osp.abspath(str(image_path)),
+            self.image.width(),
+            self.image.height(),
+            image_hash,
+        )
+
+    def _armHostedSam2PointPrompt(self):
+        if self.canvas.armPointPrompt():
+            self.status("SAM2 point prompt armed. Click an object.")
+        else:
+            self.errorMessage(
+                "Hosted SAM2",
+                "Cannot arm point prompt without an image.",
+            )
+
+    def _hostedSam2ImageRegistered(self, response, context):
+        frame_key = context["frame_key"]
+        if frame_key != self._hostedSam2FrameKey():
+            self.status("Ignored hosted SAM2 registration for a stale frame.")
+            return
+        if (
+            response["width"] != self.image.width()
+            or response["height"] != self.image.height()
+        ):
+            self.errorMessage(
+                "Hosted SAM2",
+                "Backend image dimensions do not match the current frame.",
+            )
+            return
+        self._hosted_sam2_image_cache[frame_key] = response
+        self._armHostedSam2PointPrompt()
+
+    def _hostedSam2PointPrompt(self, point):
+        frame_key = self._hostedSam2FrameKey()
+        image_info = self._hosted_sam2_image_cache.get(frame_key)
+        if image_info is None:
+            self.errorMessage("Hosted SAM2", "Current frame is not registered.")
+            return
+        if self._hosted_sam2_request_active:
+            self.status("Hosted SAM2 request already in progress.")
+            return
+
+        self.status("Sending SAM2 point prompt...")
+        self._runHostedSam2Request(
+            self._hosted_sam2_client.point_prompt,
+            self._hostedSam2PointPromptFinished,
+            image_info["image_id"],
+            point.x(),
+            point.y(),
+            1,
+            _context={"frame_key": frame_key},
+        )
+
+    def _hostedSam2PointPromptCancelled(self):
+        self.status("SAM2 point prompt cancelled.")
+
+    def _hostedSam2PointPromptFinished(self, response, context):
+        if context["frame_key"] != self._hostedSam2FrameKey():
+            self.status("Ignored hosted SAM2 bbox for a stale frame.")
+            return
+
+        bbox = response["bbox"]
+        width = self.image.width()
+        height = self.image.height()
+        x1 = min(max(float(bbox[0]), 0.0), float(width - 1))
+        y1 = min(max(float(bbox[1]), 0.0), float(height - 1))
+        x2 = min(max(float(bbox[2]), 0.0), float(width - 1))
+        y2 = min(max(float(bbox[3]), 0.0), float(height - 1))
+        if x2 <= x1 or y2 <= y1:
+            self.errorMessage("Hosted SAM2", "Hosted SAM2 returned an empty bbox.")
+            return
+
+        metadata = self._promptForNewShapeMetadata()
+        if metadata is None:
+            self.setEditMode()
+            return
+
+        text_label, flags, group_id, description, text_id = metadata
+        shape = Shape(label=text_label, shape_type="rectangle", flags=flags)
+        shape.addPoint(QtCore.QPointF(x1, y1))
+        shape.addPoint(QtCore.QPointF(x2, y2))
+        shape.close()
+        self.canvas.shapes.append(shape)
+        self.canvas.storeShapes()
+        self.canvas.update()
+        self._finishNewShape(shape, group_id, text_id, description)
+        self.status("SAM2 bbox added.")
+
+    def _runHostedSam2Request(self, function, on_success, *args, **kwargs):
+        context = kwargs.pop("_context", {})
+        worker = HostedSam2RequestWorker(function, *args, **kwargs)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        self._hosted_sam2_worker = worker
+        self._hosted_sam2_thread = thread
+        self._hosted_sam2_request_active = True
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(
+            lambda result: self._hostedSam2RequestSucceeded(
+                on_success, result, context
+            )
+        )
+        worker.failed.connect(self._hostedSam2RequestFailed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self._hostedSam2RequestCleanedUp(
+                thread, worker
+            )
+        )
+        thread.start()
+
+    def _hostedSam2RequestSucceeded(self, on_success, result, context):
+        self._hosted_sam2_request_active = False
+        try:
+            on_success(result, context)
+        except Exception as exc:
+            logger.exception("Hosted SAM2 response handling failed")
+            self.errorMessage("Hosted SAM2", str(exc))
+
+    def _hostedSam2RequestFailed(self, message):
+        self._hosted_sam2_request_active = False
+        self.errorMessage("Hosted SAM2", message)
+
+    def _hostedSam2RequestCleanedUp(self, thread, worker):
+        if self._hosted_sam2_thread is thread:
+            self._hosted_sam2_thread = None
+        if self._hosted_sam2_worker is worker:
+            self._hosted_sam2_worker = None
+
     def editID(self, item=None):
         if item and not isinstance(item, IDListWidgetItem):
             raise TypeError("item must be IDListWidgetItem type")
@@ -2698,11 +2985,7 @@ class MainWindow(QtWidgets.QMainWindow):
             track_id += 1
         return str(track_id)
 
-    def newShape(self):
-        """Pop-up and give focus to the label editor.
-
-        position MUST be in global coordinates.
-        """
+    def _promptForNewShapeMetadata(self):
         items = self.uniqLabelList.selectedItems()
         text_label = None
         text_id = None
@@ -2713,7 +2996,7 @@ class MainWindow(QtWidgets.QMainWindow):
         description = ""
         if self._config["display_label_popup"] or not text_label:
             previous_text_label = self.labelDialog.edit.text()
-            if self.mode == "NORMAL":
+            if self.mode in ["NORMAL", "None"]:
                 text_label, flags, group_id, description = self.labelDialog.popUp(
                     text_label
                 )
@@ -2736,23 +3019,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 ),
             )
             text_label = ""
-        if text_label:
-            if not text_id:
-                text_id = self._nextTrackId()
-            self.labelList.clearSelection()
-            self.IDList.clearSelection()
-            shape = self.canvas.setLastLabel(text_label, flags)
-            shape.group_id = group_id
-            shape.track_id = text_id
-            shape.description = description
-            self.addLabel(shape)
-            self.actions.undoLastPoint.setEnabled(False)
-            self.actions.undo.setEnabled(True)
-            self.setDirty()
-            self.setEditMode()
-        else:
+        if not text_label:
+            return None
+        if not text_id:
+            text_id = self._nextTrackId()
+        return text_label, flags, group_id, description, text_id
+
+    def _finishNewShape(self, shape, group_id, track_id, description):
+        self.labelList.clearSelection()
+        self.IDList.clearSelection()
+        shape.group_id = group_id
+        shape.track_id = track_id
+        shape.description = description
+        self.addLabel(shape)
+        self.actions.undoLastPoint.setEnabled(False)
+        self.actions.undo.setEnabled(True)
+        self.setDirty()
+        self.setEditMode()
+
+    def newShape(self):
+        """Pop-up and give focus to the label editor."""
+        metadata = self._promptForNewShapeMetadata()
+        if metadata is None:
             self.canvas.undoLastLine()
             self.canvas.shapesBackups.pop()
+            return
+
+        text_label, flags, group_id, description, text_id = metadata
+        shape = self.canvas.setLastLabel(text_label, flags)
+        self._finishNewShape(shape, group_id, text_id, description)
 
     def scrollRequest(self, delta, orientation):
         units = -delta * 0.1  # natural scroll

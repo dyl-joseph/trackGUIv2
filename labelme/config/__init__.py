@@ -45,6 +45,10 @@ def validate_config_item(key, value):
         raise ValueError(
             "Unexpected value for config key 'validate_label': {}".format(value)
         )
+    if key == "theme" and value not in [None, "system", "light", "dark"]:
+        raise ValueError(
+            "Unexpected value for config key 'theme': {}".format(value)
+        )
     if key == "shape_color" and value not in [None, "auto", "manual"]:
         raise ValueError(
             "Unexpected value for config key 'shape_color': {}".format(value)

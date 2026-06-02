@@ -30,6 +30,7 @@ def get_install_requires():
         "Pillow>=2.8",
         "PyYAML",
         "qtpy!=1.11.2",
+        "requests",
         "scikit-image",
         "termcolor",
         "filterpy",
