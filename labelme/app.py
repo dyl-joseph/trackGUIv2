@@ -1340,6 +1340,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.recentFiles.pop()
         self.recentFiles.insert(0, filename)
 
+    def _brightnessContrastKey(self, filename=None):
+        if filename is None:
+            filename = self.filename
+
+        if filename:
+            filename = osp.abspath(str(filename))
+            if self.lastOpenDir and filename in self.imageList:
+                return osp.normpath(osp.abspath(self.lastOpenDir))
+            return osp.normpath(osp.dirname(filename))
+
+        if self.lastOpenDir:
+            return osp.normpath(osp.abspath(self.lastOpenDir))
+        return None
+
+    def _previousBrightnessContrastValues(self, current_key):
+        for filename in self.recentFiles:
+            previous_key = self._brightnessContrastKey(filename)
+            if previous_key and previous_key != current_key:
+                return self.brightnessContrast_values.get(previous_key, (None, None))
+        return (None, None)
+
     # Callbacks
 
     def undoShapeEdit(self):
@@ -3122,9 +3143,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.onNewBrightnessContrast,
             parent=self,
         )
-        brightness, contrast = self.brightnessContrast_values.get(
-            self.filename, (None, None)
-        )
+        key = self._brightnessContrastKey()
+        brightness, contrast = self.brightnessContrast_values.get(key, (None, None))
         if brightness is not None:
             dialog.slider_brightness.setValue(brightness)
         if contrast is not None:
@@ -3133,7 +3153,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         brightness = dialog.slider_brightness.value()
         contrast = dialog.slider_contrast.value()
-        self.brightnessContrast_values[self.filename] = (brightness, contrast)
+        if key is not None:
+            self.brightnessContrast_values[key] = (brightness, contrast)
 
     def togglePolygons(self, value):
         flag = value
@@ -3274,18 +3295,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     orientation, self.scroll_values[orientation][self.filename]
                 )
         # set brightness contrast values
+        brightness_contrast_key = self._brightnessContrastKey(self.filename)
         brightness, contrast = self.brightnessContrast_values.get(
-            self.filename, (None, None)
+            brightness_contrast_key, (None, None)
         )
-        if self._config["keep_prev_brightness"] and self.recentFiles:
-            brightness, _ = self.brightnessContrast_values.get(
-                self.recentFiles[0], (None, None)
+        prev_brightness, prev_contrast = self._previousBrightnessContrastValues(
+            brightness_contrast_key
+        )
+        if self._config["keep_prev_brightness"] and brightness is None:
+            brightness = prev_brightness
+        if self._config["keep_prev_contrast"] and contrast is None:
+            contrast = prev_contrast
+        if brightness_contrast_key is not None:
+            self.brightnessContrast_values[brightness_contrast_key] = (
+                brightness,
+                contrast,
             )
-        if self._config["keep_prev_contrast"] and self.recentFiles:
-            _, contrast = self.brightnessContrast_values.get(
-                self.recentFiles[0], (None, None)
-            )
-        self.brightnessContrast_values[self.filename] = (brightness, contrast)
         if brightness is not None or contrast is not None:
             dialog = BrightnessContrastDialog(
                 utils.img_data_to_pil(self.imageData),

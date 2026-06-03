@@ -140,6 +140,43 @@ class FailingIDDialog:
         self.history.append(track_id)
 
 
+class FakeSlider:
+    def __init__(self):
+        self._value = 0
+
+    def setValue(self, value):
+        self._value = value
+
+    def value(self):
+        return self._value
+
+
+class FakeBrightnessContrastDialog:
+    next_brightness = 0
+    next_contrast = 0
+    instances = []
+
+    def __init__(self, image, callback, parent=None):
+        self.slider_brightness = FakeSlider()
+        self.slider_contrast = FakeSlider()
+        self._callback = callback
+        self._parent = parent
+        self.exec_calls = 0
+        self.applied_values = []
+        type(self).instances.append(self)
+
+    def exec_(self):
+        self.exec_calls += 1
+        self.slider_brightness.setValue(type(self).next_brightness)
+        self.slider_contrast.setValue(type(self).next_contrast)
+
+    def onNewValue(self, _value):
+        self.applied_values.append(
+            (self.slider_brightness.value(), self.slider_contrast.value())
+        )
+        self._callback(QtGui.QImage.fromData(self._parent.imageData))
+
+
 @pytest.mark.gui
 def test_MainWindow_openNextImg(qtbot):
     win = create_MainWindow_with_directory(qtbot)
@@ -150,6 +187,121 @@ def test_MainWindow_openNextImg(qtbot):
 def test_MainWindow_openPrevImg(qtbot):
     win = create_MainWindow_with_directory(qtbot)
     win.openNextImg()
+
+
+@pytest.mark.gui
+def test_brightness_contrast_persists_across_video_frames(qtbot, monkeypatch):
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        image_files = _copy_test_image_sequence(tmp_dir)
+        monkeypatch.setattr(
+            labelme.app,
+            "BrightnessContrastDialog",
+            FakeBrightnessContrastDialog,
+        )
+        FakeBrightnessContrastDialog.instances.clear()
+        FakeBrightnessContrastDialog.next_brightness = 65
+        FakeBrightnessContrastDialog.next_contrast = 80
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config, filename=tmp_dir)
+        qtbot.addWidget(win)
+        _win_show_and_wait_imageData(qtbot, win)
+
+        video_key = win._brightnessContrastKey()
+        assert video_key == osp.normpath(osp.abspath(tmp_dir))
+
+        win.brightnessContrast(None)
+
+        assert win.brightnessContrast_values == {video_key: (65, 80)}
+
+        win.openNextImg()
+
+        assert win.filename == image_files[1]
+        assert win._brightnessContrastKey() == video_key
+        assert len(win.brightnessContrast_values) == 1
+        assert FakeBrightnessContrastDialog.instances[-1].applied_values == [(65, 80)]
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
+def test_brightness_contrast_does_not_carry_to_new_video_by_default(
+    qtbot, monkeypatch
+):
+    first_dir = tempfile.mkdtemp()
+    second_dir = tempfile.mkdtemp()
+    try:
+        _copy_test_image_sequence(first_dir)
+        _copy_test_image_sequence(second_dir)
+        monkeypatch.setattr(
+            labelme.app,
+            "BrightnessContrastDialog",
+            FakeBrightnessContrastDialog,
+        )
+        FakeBrightnessContrastDialog.instances.clear()
+        FakeBrightnessContrastDialog.next_brightness = 55
+        FakeBrightnessContrastDialog.next_contrast = 75
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config, filename=first_dir)
+        qtbot.addWidget(win)
+        _win_show_and_wait_imageData(qtbot, win)
+
+        first_key = win._brightnessContrastKey()
+        win.brightnessContrast(None)
+        dialog_count = len(FakeBrightnessContrastDialog.instances)
+
+        win.importDirImages(second_dir)
+
+        second_key = win._brightnessContrastKey()
+        assert second_key == osp.normpath(osp.abspath(second_dir))
+        assert second_key != first_key
+        assert len(FakeBrightnessContrastDialog.instances) == dialog_count
+        assert win.brightnessContrast_values[first_key] == (55, 75)
+        assert win.brightnessContrast_values[second_key] == (None, None)
+    finally:
+        shutil.rmtree(first_dir)
+        shutil.rmtree(second_dir)
+
+
+@pytest.mark.gui
+def test_brightness_contrast_keep_prev_carries_between_videos(qtbot, monkeypatch):
+    first_dir = tempfile.mkdtemp()
+    second_dir = tempfile.mkdtemp()
+    try:
+        _copy_test_image_sequence(first_dir)
+        _copy_test_image_sequence(second_dir)
+        monkeypatch.setattr(
+            labelme.app,
+            "BrightnessContrastDialog",
+            FakeBrightnessContrastDialog,
+        )
+        FakeBrightnessContrastDialog.instances.clear()
+        FakeBrightnessContrastDialog.next_brightness = 45
+        FakeBrightnessContrastDialog.next_contrast = 90
+
+        config = labelme.config.get_default_config()
+        config["keep_prev_brightness"] = True
+        config["keep_prev_contrast"] = True
+        win = labelme.app.MainWindow(config=config, filename=first_dir)
+        qtbot.addWidget(win)
+        _win_show_and_wait_imageData(qtbot, win)
+
+        first_key = win._brightnessContrastKey()
+        win.brightnessContrast(None)
+
+        win.importDirImages(second_dir)
+
+        second_key = win._brightnessContrastKey()
+        assert second_key == osp.normpath(osp.abspath(second_dir))
+        assert second_key != first_key
+        assert win.brightnessContrast_values[first_key] == (45, 90)
+        assert win.brightnessContrast_values[second_key] == (45, 90)
+        assert FakeBrightnessContrastDialog.instances[-1].applied_values == [(45, 90)]
+    finally:
+        shutil.rmtree(first_dir)
+        shutil.rmtree(second_dir)
 
 
 @pytest.mark.gui
