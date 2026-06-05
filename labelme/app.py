@@ -3180,6 +3180,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fileListWidget.setCurrentRow(self.imageList.index(filename))
             return
 
+        prev_shapes = list(self.canvas.shapes) if self._config["keep_prev"] else []
         self.resetState()
         self.canvas.setEnabled(False)
         if filename is None:  # image file name .jpg
@@ -3260,8 +3261,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         self.image = image  # image data
         self.filename = filename
-        if self._config["keep_prev"]:
-            prev_shapes = self.canvas.shapes
         self.canvas.loadPixmap(QtGui.QPixmap.fromImage(image))
         flags = {k: False for k in self._config["flags"] or []}
         if self.labelFile:  # if labelFile exists

@@ -345,6 +345,84 @@ def test_pending_autosave_new_bbox_stays_on_current_frame_when_opening_next(qtbo
 
 
 @pytest.mark.gui
+def test_frame_navigation_releases_stale_canvas_references(qtbot):
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        _copy_test_image_sequence(tmp_dir)
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config, filename=tmp_dir)
+        qtbot.addWidget(win)
+        _win_show_and_wait_imageData(qtbot, win)
+
+        shape = Shape(
+            label="person",
+            group_id=1,
+            track_id="1",
+            shape_type="rectangle",
+            flags={},
+        )
+        shape.addPoint(QtCore.QPointF(10, 10))
+        shape.addPoint(QtCore.QPointF(20, 20))
+        shape.close()
+        win.loadShapes([shape])
+        win.canvas.selectedShapes = [shape]
+        win.canvas.selectedShapesCopy = [shape.copy()]
+        win.canvas.current = shape
+        win.canvas.hShape = shape
+        win.canvas.prevhShape = shape
+        win.canvas.visible = {shape: True}
+
+        win.openNextImg()
+
+        assert win.canvas.shapes == []
+        assert win.canvas.selectedShapes == []
+        assert win.canvas.selectedShapesCopy == []
+        assert win.canvas.current is None
+        assert win.canvas.hShape is None
+        assert win.canvas.prevhShape is None
+        assert win.canvas.visible == {}
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
+def test_keep_prev_shapes_survive_frame_reset(qtbot):
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        _copy_test_image_sequence(tmp_dir)
+
+        config = labelme.config.get_default_config()
+        config["keep_prev"] = True
+        win = labelme.app.MainWindow(config=config, filename=tmp_dir)
+        qtbot.addWidget(win)
+        _win_show_and_wait_imageData(qtbot, win)
+
+        shape = Shape(
+            label="person",
+            group_id=1,
+            track_id="1",
+            shape_type="rectangle",
+            flags={},
+        )
+        shape.addPoint(QtCore.QPointF(10, 10))
+        shape.addPoint(QtCore.QPointF(20, 20))
+        shape.close()
+        win.loadShapes([shape])
+
+        win.openNextImg()
+
+        assert len(win.canvas.shapes) == 1
+        assert win.canvas.shapes[0].label == "person"
+        assert [(p.x(), p.y()) for p in win.canvas.shapes[0].points] == [
+            (10.0, 10.0),
+            (20.0, 20.0),
+        ]
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
 def test_keyboard_bbox_move_autosaves_before_frame_change(qtbot):
     tmp_dir = tempfile.mkdtemp()
     try:
