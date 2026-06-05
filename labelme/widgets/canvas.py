@@ -1098,5 +1098,18 @@ class Canvas(QtWidgets.QWidget):
         self.cancelPointPrompt(emit_signal=False)
         self.restoreCursor()
         self.pixmap = None
+        self.shapes = []
+        self.selectedShapes = []
+        self.selectedShapesCopy = []
+        self.current = None
+        self.line = Shape()
+        self.visible = {}
+        self.hShape = None
+        self.prevhShape = None
+        self.hVertex = None
+        self.prevhVertex = None
+        self.hEdge = None
+        self.prevhEdge = None
+        self.movingShape = False
         self.shapesBackups = []
         self.update()

@@ -1,4 +1,5 @@
 import collections
+import hashlib
 import threading
 
 import imgviz
@@ -8,6 +9,10 @@ import skimage
 
 from ..logger import logger
 from . import _utils
+
+
+def _image_cache_key(image):
+    return (image.shape, image.dtype.str, hashlib.sha256(image.tobytes()).digest())
 
 
 class EfficientSam:
@@ -27,6 +32,7 @@ class EfficientSam:
         with self._lock:
             self._image_embedding_cache.clear()
             self._image = None
+            self._image_cache_key = None
             self._image_embedding = None
             self._encoder_session = None
             self._decoder_session = None
@@ -35,11 +41,11 @@ class EfficientSam:
         if self._thread is not None:
             self._thread.join()
             self._thread = None
+        image_cache_key = _image_cache_key(image)
         with self._lock:
             self._image = image
-            self._image_embedding = self._image_embedding_cache.get(
-                self._image.tobytes()
-            )
+            self._image_cache_key = image_cache_key
+            self._image_embedding = self._image_embedding_cache.get(image_cache_key)
 
         if self._image_embedding is None:
             self._thread = threading.Thread(
@@ -56,9 +62,8 @@ class EfficientSam:
                 output_names=None,
                 input_feed={"batched_images": batched_images},
             )
-            if len(self._image_embedding_cache) > 10:
-                self._image_embedding_cache.popitem(last=False)
-            self._image_embedding_cache[self._image.tobytes()] = self._image_embedding
+            self._image_embedding_cache.clear()
+            self._image_embedding_cache[self._image_cache_key] = self._image_embedding
             logger.debug("Done computing image embedding.")
 
     def _get_image_embedding(self):
