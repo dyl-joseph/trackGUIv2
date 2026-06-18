@@ -215,6 +215,22 @@ class LabelDialog(QtWidgets.QDialog):
             return int(group_id)
         return group_id
 
+    def _moveToSafeCursorPosition(self):
+        self.adjustSize()
+        cursor_pos = QtGui.QCursor.pos() + QtCore.QPoint(16, 16)
+        screen = QtGui.QGuiApplication.screenAt(cursor_pos)
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            self.move(cursor_pos)
+            return
+
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+        x = min(cursor_pos.x(), available.right() - frame.width() + 1)
+        y = min(cursor_pos.y(), available.bottom() - frame.height() + 1)
+        self.move(max(x, available.left()), max(y, available.top()))
+
     def popUp(self, text=None, move=True, flags=None, group_id=None, description=None):
         if self._fit_to_content["row"]:
             self.labelList.setMinimumHeight(
@@ -248,7 +264,7 @@ class LabelDialog(QtWidgets.QDialog):
             self.edit.completer().setCurrentRow(row)
         self.edit.setFocus(QtCore.Qt.PopupFocusReason)
         if move:
-            self.move(QtGui.QCursor.pos())
+            self._moveToSafeCursorPosition()
         if self.exec_():
             return (
                 self.edit.text(),

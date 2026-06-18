@@ -1,5 +1,6 @@
 import pytest
 from qtpy import QtCore
+from qtpy import QtGui
 from qtpy import QtWidgets
 
 from labelme.widgets import LabelDialog
@@ -91,3 +92,32 @@ def test_LabelDialog_popUp(qtbot):
     assert flags == {}
     assert group_id is None
     assert description == ""
+
+
+@pytest.mark.gui
+def test_LabelDialog_popUp_moves_off_cursor_and_stays_on_screen(qtbot, monkeypatch):
+    class FakeScreen:
+        def availableGeometry(self):
+            return QtCore.QRect(0, 0, 200, 200)
+
+    widget = LabelDialog(labels=["cat"], sort_labels=True)
+    qtbot.addWidget(widget)
+
+    cursor_pos = QtCore.QPoint(190, 190)
+    monkeypatch.setattr(QtGui.QCursor, "pos", lambda: cursor_pos)
+    monkeypatch.setattr(QtGui.QGuiApplication, "screenAt", lambda _pos: FakeScreen())
+    monkeypatch.setattr(
+        QtGui.QGuiApplication, "primaryScreen", lambda: FakeScreen()
+    )
+    monkeypatch.setattr(widget, "exec_", lambda: 0)
+
+    widget.popUp("cat")
+
+    assert widget.pos() != cursor_pos
+    available = FakeScreen().availableGeometry()
+    assert available.contains(widget.pos())
+    frame = widget.frameGeometry()
+    assert frame.left() >= available.left()
+    assert frame.top() >= available.top()
+    assert frame.right() <= available.right()
+    assert frame.bottom() <= available.bottom()

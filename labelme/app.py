@@ -3015,20 +3015,19 @@ class MainWindow(QtWidgets.QMainWindow):
         flags = {}
         group_id = None
         description = ""
-        if self._config["display_label_popup"] or not text_label:
+        if self.mode not in ["NORMAL", "None"]:
+            text_label = self.label_INPO
+            flags = {}
+            group_id = None
+            description = ""
+            text_id = self.ID_INPO
+        elif self._config["display_label_popup"] or not text_label:
             previous_text_label = self.labelDialog.edit.text()
-            if self.mode in ["NORMAL", "None"]:
-                text_label, flags, group_id, description = self.labelDialog.popUp(
-                    text_label
-                )
-                if group_id is not None:
-                    text_id = str(group_id)
-            else:
-                text_label = self.label_INPO
-                flags = {}
-                group_id = None
-                description = ""
-                text_id = self.ID_INPO
+            text_label, flags, group_id, description = self.labelDialog.popUp(
+                text_label
+            )
+            if group_id is not None:
+                text_id = str(group_id)
             if not text_label:
                 self.labelDialog.edit.setText(previous_text_label)
 

@@ -589,6 +589,35 @@ def test_canvas_point_prompt_emits_image_coordinates(qtbot):
 
 
 @pytest.mark.gui
+def test_promptForNewShapeMetadata_uses_tracking_values_outside_normal_mode(qtbot):
+    class RaisingLabelDialog:
+        def __init__(self):
+            self.edit = QtWidgets.QLineEdit()
+
+        def popUp(self, text=None):
+            raise AssertionError("tracking modes should bypass the label popup")
+
+    config = labelme.config.get_default_config()
+    config["display_label_popup"] = False
+    win = labelme.app.MainWindow(config=config)
+    qtbot.addWidget(win)
+
+    item = win.uniqLabelList.createItemFromLabel("selected-label")
+    win.uniqLabelList.addItem(item)
+    win.uniqLabelList.setCurrentItem(item)
+    item.setSelected(True)
+
+    win.mode = "TRACK INTERPOLATION"
+    win.label_INPO = "tracked-label"
+    win.ID_INPO = "42"
+    win.labelDialog = RaisingLabelDialog()
+
+    metadata = win._promptForNewShapeMetadata()
+
+    assert metadata == ("tracked-label", {}, None, "", "42")
+
+
+@pytest.mark.gui
 def test_hosted_sam2_point_prompt_adds_bbox_with_existing_popup(qtbot):
     img_file = osp.join(data_dir, "raw/2011_000003.jpg")
     config = labelme.config.get_default_config()
