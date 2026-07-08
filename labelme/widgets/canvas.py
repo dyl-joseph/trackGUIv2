@@ -18,6 +18,8 @@ CURSOR_POINT = QtCore.Qt.PointingHandCursor
 CURSOR_DRAW = QtCore.Qt.CrossCursor
 CURSOR_MOVE = QtCore.Qt.ClosedHandCursor
 CURSOR_GRAB = QtCore.Qt.OpenHandCursor
+CURSOR_RESIZE_HORIZONTAL = QtCore.Qt.SizeHorCursor
+CURSOR_RESIZE_VERTICAL = QtCore.Qt.SizeVerCursor
 
 MOVE_SPEED = 5.0
 
@@ -89,6 +91,8 @@ class Canvas(QtWidgets.QWidget):
         self.prevhVertex = None
         self.hEdge = None
         self.prevhEdge = None
+        self.hResizeEdge = None
+        self.prevhResizeEdge = None
         self.movingShape = False
         self.snapping = True
         self.hShapeIsSelected = False
@@ -252,13 +256,20 @@ class Canvas(QtWidgets.QWidget):
         self.prevhShape = self.hShape
         self.prevhVertex = self.hVertex
         self.prevhEdge = self.hEdge
-        self.hShape = self.hVertex = self.hEdge = None
+        self.prevhResizeEdge = self.hResizeEdge
+        self.hShape = None
+        self.hVertex = None
+        self.hEdge = None
+        self.hResizeEdge = None
 
     def selectedVertex(self):
         return self.hVertex is not None
 
     def selectedEdge(self):
         return self.hEdge is not None
+
+    def selectedResizeEdge(self):
+        return self.hResizeEdge is not None
 
     def mouseMoveEvent(self, ev):
         """Update line with last point and current coordinates."""
@@ -357,6 +368,10 @@ class Canvas(QtWidgets.QWidget):
                 self.boundedMoveVertex(pos)
                 self.repaint()
                 self.movingShape = True
+            elif self.selectedResizeEdge():
+                self.boundedResizeRectangleEdge(pos)
+                self.repaint()
+                self.movingShape = True
             elif self.selectedShapes and self.prevPoint:
                 self.overrideCursor(CURSOR_MOVE)
                 self.boundedMoveShapes(self.selectedShapes, pos)
@@ -373,6 +388,7 @@ class Canvas(QtWidgets.QWidget):
             # Look for a nearby vertex to highlight. If that fails,
             # check if we happen to be inside a shape.
             index = shape.nearestVertex(pos, self.epsilon / self.scale)
+            resize_edge = shape.nearestRectangleEdge(pos, self.epsilon / self.scale)
             index_edge = shape.nearestEdge(pos, self.epsilon / self.scale)
             if index is not None:
                 if self.selectedVertex():
@@ -381,9 +397,32 @@ class Canvas(QtWidgets.QWidget):
                 self.prevhShape = self.hShape = shape
                 self.prevhEdge = self.hEdge
                 self.hEdge = None
+                self.prevhResizeEdge = self.hResizeEdge
+                self.hResizeEdge = None
                 shape.highlightVertex(index, shape.MOVE_VERTEX)
                 self.overrideCursor(CURSOR_POINT)
                 self.setToolTip(self.tr("Click & drag to move point"))
+                self.setStatusTip(self.toolTip())
+                self.update()
+                break
+            elif resize_edge is not None:
+                if self.selectedVertex():
+                    self.hShape.highlightClear()
+                self.prevhVertex = self.hVertex
+                self.hVertex = None
+                self.prevhShape = self.hShape = shape
+                self.prevhEdge = self.hEdge
+                self.hEdge = None
+                self.prevhResizeEdge = self.hResizeEdge
+                self.hResizeEdge = resize_edge
+                edge_name = resize_edge[0]
+                cursor = (
+                    CURSOR_RESIZE_HORIZONTAL
+                    if edge_name in ["left", "right"]
+                    else CURSOR_RESIZE_VERTICAL
+                )
+                self.overrideCursor(cursor)
+                self.setToolTip(self.tr("Click & drag to resize rectangle"))
                 self.setStatusTip(self.toolTip())
                 self.update()
                 break
@@ -394,6 +433,8 @@ class Canvas(QtWidgets.QWidget):
                 self.hVertex = None
                 self.prevhShape = self.hShape = shape
                 self.prevhEdge = self.hEdge = index_edge
+                self.prevhResizeEdge = self.hResizeEdge
+                self.hResizeEdge = None
                 self.overrideCursor(CURSOR_POINT)
                 self.setToolTip(self.tr("Click to create point"))
                 self.setStatusTip(self.toolTip())
@@ -407,6 +448,8 @@ class Canvas(QtWidgets.QWidget):
                 self.prevhShape = self.hShape = shape
                 self.prevhEdge = self.hEdge
                 self.hEdge = None
+                self.prevhResizeEdge = self.hResizeEdge
+                self.hResizeEdge = None
                 self.setToolTip(
                     self.tr("Click & drag to move shape '%s'") % shape.label
                 )
@@ -656,6 +699,17 @@ class Canvas(QtWidgets.QWidget):
         if self.outOfPixmap(pos):
             pos = self.intersectionPoint(point, pos)
         shape.moveVertexBy(index, pos - point)
+
+    def boundedResizeRectangleEdge(self, pos):
+        shape = self.hShape
+        edge = self.hResizeEdge
+        if shape is None or edge is None:
+            return
+        if self.outOfPixmap(pos):
+            x = min(max(pos.x(), 0), self.pixmap.width() - 1)
+            y = min(max(pos.y(), 0), self.pixmap.height() - 1)
+            pos = QtCore.QPointF(x, y)
+        shape.moveRectangleEdgeTo(edge, pos)
 
     def boundedMoveShapes(self, shapes, pos):
         if self.outOfPixmap(pos):
@@ -1080,6 +1134,7 @@ class Canvas(QtWidgets.QWidget):
         self.hShape = None
         self.hVertex = None
         self.hEdge = None
+        self.hResizeEdge = None
         self.update()
 
     def setShapeVisible(self, shape, value):
@@ -1110,6 +1165,8 @@ class Canvas(QtWidgets.QWidget):
         self.prevhVertex = None
         self.hEdge = None
         self.prevhEdge = None
+        self.hResizeEdge = None
+        self.prevhResizeEdge = None
         self.movingShape = False
         self.shapesBackups = []
         self.update()
