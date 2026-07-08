@@ -194,6 +194,50 @@ class Shape(object):
         x2, y2 = pt2.x(), pt2.y()
         return QtCore.QRectF(x1, y1, x2 - x1, y2 - y1)
 
+    def nearestRectangleEdge(self, point, epsilon):
+        if self.shape_type != "rectangle" or len(self.points) != 2:
+            return None
+
+        rect = self.getRectFromLine(*self.points).normalized()
+        top_left = rect.topLeft()
+        top_right = rect.topRight()
+        bottom_right = rect.bottomRight()
+        bottom_left = rect.bottomLeft()
+        p0, p1 = self.points
+        left_index = 0 if p0.x() <= p1.x() else 1
+        right_index = 1 - left_index
+        top_index = 0 if p0.y() <= p1.y() else 1
+        bottom_index = 1 - top_index
+        edges = [
+            ("left", left_index, [top_left, bottom_left]),
+            ("right", right_index, [top_right, bottom_right]),
+            ("top", top_index, [top_left, top_right]),
+            ("bottom", bottom_index, [bottom_left, bottom_right]),
+        ]
+
+        min_distance = float("inf")
+        nearest_edge = None
+        for name, point_index, line in edges:
+            dist = labelme.utils.distancetoline(point, line)
+            if dist <= epsilon and dist < min_distance:
+                min_distance = dist
+                nearest_edge = (name, point_index)
+        return nearest_edge
+
+    def moveRectangleEdgeTo(self, edge, point):
+        if edge is None or self.shape_type != "rectangle" or len(self.points) != 2:
+            return
+
+        edge_name, point_index = edge
+        current = self.points[point_index]
+        if edge_name in ["left", "right"]:
+            self.points[point_index] = QtCore.QPointF(point.x(), current.y())
+        elif edge_name in ["top", "bottom"]:
+            self.points[point_index] = QtCore.QPointF(current.x(), point.y())
+        else:
+            raise ValueError("Unexpected rectangle edge: {}".format(edge_name))
+        self._cached_path = None
+
     def paint(self, painter):
         if self.mask is None and not self.points:
             return
