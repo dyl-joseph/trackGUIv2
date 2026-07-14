@@ -1990,7 +1990,7 @@ class MainWindow(QtWidgets.QMainWindow):
             shape["track_id"] = track_id
             shape["group_id"] = int(track_id) if track_id.isdigit() else track_id
 
-        frame_labels = []
+        frame_paths = []
         for img_path in imageSlice:
             basename = osp.splitext(osp.basename(img_path))[0] + ".json"
             json_path = osp.splitext(img_path)[0] + ".json"
@@ -2001,14 +2001,19 @@ class MainWindow(QtWidgets.QMainWindow):
             if not os.path.isfile(json_path):
                 continue
 
-            loaded_label = LabelFile(json_path)
-            frame_labels.append((img_path, json_path, loaded_label))
+            frame_paths.append((img_path, json_path))
 
-        source_exists = any(
-            labels_match(shape) and shape_track_id(shape) == ID
-            for _, _, loaded_label in frame_labels
-            for shape in loaded_label.shapes
-        )
+        source_exists = False
+        if mode == "Swap ID":
+            for _, json_path in frame_paths:
+                loaded_label = LabelFile(json_path)
+                source_exists = any(
+                    labels_match(shape) and shape_track_id(shape) == ID
+                    for shape in loaded_label.shapes
+                )
+                if source_exists:
+                    break
+            loaded_label = None
         if mode == "Swap ID" and not source_exists:
             self.errorMessage(
                 "Track Modification",
@@ -2017,7 +2022,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         lf = LabelFile()
-        for img_path, json_path, loaded_label in frame_labels:
+        for img_path, json_path in frame_paths:
+            loaded_label = LabelFile(json_path)
             loaded_shape = loaded_label.shapes
             new_shape = []
             for s in loaded_shape:
