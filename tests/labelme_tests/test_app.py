@@ -981,6 +981,94 @@ def test_track_modification_swap_id_exchanges_existing_track(qtbot, monkeypatch)
 
 
 @pytest.mark.gui
+def test_track_modification_swap_id_handles_label_case_change(qtbot, monkeypatch):
+    class AcceptedSwapIDDialog:
+        def __init__(self, parent=None):
+            self.start_frame_cell = QtWidgets.QLineEdit("1")
+            self.end_frame_cell = QtWidgets.QLineEdit("2")
+            self.ID_cell = QtWidgets.QLineEdit("11")
+            self.label_cell = QtWidgets.QLineEdit("Person")
+            self.new_ID_cell = QtWidgets.QLineEdit("12")
+            self.new_label_cell = QtWidgets.QLineEdit("")
+
+        @property
+        def mode(self):
+            return "Swap ID"
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        image_files = [
+            osp.join(tmp_dir, "000001.jpg"),
+            osp.join(tmp_dir, "000002.jpg"),
+        ]
+        for image_file in image_files:
+            shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+
+        shapes = [
+            dict(
+                label="Person",
+                group_id=11,
+                track_id="11",
+                points=[(10, 10), (20, 20)],
+                shape_type="rectangle",
+                flags={},
+                description=None,
+                mask=None,
+            ),
+            dict(
+                label="Person",
+                group_id=12,
+                track_id="12",
+                points=[(30, 30), (40, 40)],
+                shape_type="rectangle",
+                flags={},
+                description=None,
+                mask=None,
+            ),
+        ]
+        for index, image_file in enumerate(image_files):
+            frame_shapes = [shape.copy() for shape in shapes]
+            if index == 1:
+                frame_shapes[0]["label"] = "person"
+            LabelFile().save(
+                filename=osp.splitext(image_file)[0] + ".json",
+                shapes=frame_shapes,
+                imagePath=osp.basename(image_file),
+                imageData=None,
+                imageHeight=10,
+                imageWidth=10,
+                flags={},
+            )
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config)
+        qtbot.addWidget(win)
+        win._imageListCache = image_files
+        win.lastOpenDir = tmp_dir
+        win.image = QtGui.QImage(10, 10, QtGui.QImage.Format_RGB32)
+        win.loadFile = lambda filename=None: None
+        win.informationMessage = lambda title, message: None
+        win.errorMessage = lambda title, message: pytest.fail(message)
+
+        monkeypatch.setattr(labelme.app, "DeletionDialog", AcceptedSwapIDDialog)
+
+        win.DELETION()
+
+        for image_file in image_files:
+            data = json.load(open(osp.splitext(image_file)[0] + ".json"))
+            source, destination = data["shapes"]
+            assert source["track_id"] == "12"
+            assert source["group_id"] == 12
+            assert destination["track_id"] == "11"
+            assert destination["group_id"] == 11
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
 def test_track_modification_remove_box_with_new_id_does_not_delete(
     qtbot, monkeypatch
 ):

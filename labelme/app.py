@@ -1942,7 +1942,7 @@ class MainWindow(QtWidgets.QMainWindow):
         start_frame = int(dialog.start_frame_cell.text().replace(" ", ""))
         end_frame = int(dialog.end_frame_cell.text().replace(" ", ""))
         ID = dialog.ID_cell.text().replace(" ", "")
-        label = dialog.label_cell.text().replace(" ", "")
+        label = dialog.label_cell.text().strip()
 
         if end_frame - start_frame <= 0:
             self.errorMessage(
@@ -1954,7 +1954,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         mode = dialog.mode
         new_ID = dialog.new_ID_cell.text().replace(" ", "")
-        new_label = dialog.new_label_cell.text().replace(" ", "")
+        new_label = dialog.new_label_cell.text().strip()
         if mode == "Swap ID" and not new_ID:
             self.errorMessage(
                 "Track Modification",
@@ -1977,11 +1977,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         imageSlice = self.imageList[start_frame - 1 : end_frame]
 
+        def shape_track_id(shape):
+            track_id = shape.get("track_id")
+            if track_id is None or track_id == "":
+                track_id = shape.get("group_id")
+            return None if track_id is None else str(track_id)
+
+        def labels_match(shape):
+            return str(shape.get("label", "")).casefold() == label.casefold()
+
         def set_shape_track_id(shape, track_id):
             shape["track_id"] = track_id
             shape["group_id"] = int(track_id) if track_id.isdigit() else track_id
 
-        lf = LabelFile()
+        frame_labels = []
         for img_path in imageSlice:
             basename = osp.splitext(osp.basename(img_path))[0] + ".json"
             json_path = osp.splitext(img_path)[0] + ".json"
@@ -1993,11 +2002,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
 
             loaded_label = LabelFile(json_path)
+            frame_labels.append((img_path, json_path, loaded_label))
+
+        source_exists = any(
+            labels_match(shape) and shape_track_id(shape) == ID
+            for _, _, loaded_label in frame_labels
+            for shape in loaded_label.shapes
+        )
+        if mode == "Swap ID" and not source_exists:
+            self.errorMessage(
+                "Track Modification",
+                f"Track {label}-{ID} was not found in the selected frame range.",
+            )
+            return
+
+        lf = LabelFile()
+        for img_path, json_path, loaded_label in frame_labels:
             loaded_shape = loaded_label.shapes
             new_shape = []
             for s in loaded_shape:
-                tid = s.get("track_id") or s.get("group_id")
-                match = s["label"] == label and str(tid) == str(ID)
+                tid = shape_track_id(s)
+                matching_label = labels_match(s)
+                match = matching_label and tid == ID
                 if match and mode == "Remove Box":
                     continue
                 if match and mode == "Swap ID" and new_ID:
@@ -2005,8 +2031,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif (
                     mode == "Swap ID"
                     and new_ID
-                    and s["label"] == label
-                    and str(tid) == str(new_ID)
+                    and matching_label
+                    and tid == new_ID
                 ):
                     set_shape_track_id(s, ID)
                 if match and mode == "Swap Label" and new_label:
