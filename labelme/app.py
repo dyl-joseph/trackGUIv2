@@ -1984,7 +1984,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return None if track_id is None else str(track_id)
 
         def labels_match(shape):
-            return str(shape.get("label", "")).casefold() == label.casefold()
+            return str(shape.get("label", "")) == label
 
         def set_shape_track_id(shape, track_id):
             shape["track_id"] = track_id
@@ -2025,6 +2025,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for img_path, json_path in frame_paths:
             loaded_label = LabelFile(json_path)
             loaded_shape = loaded_label.shapes
+            frame_source_exists = any(
+                labels_match(shape) and shape_track_id(shape) == ID
+                for shape in loaded_shape
+            )
             new_shape = []
             for s in loaded_shape:
                 tid = shape_track_id(s)
@@ -2037,6 +2041,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif (
                     mode == "Swap ID"
                     and new_ID
+                    and frame_source_exists
                     and matching_label
                     and tid == new_ID
                 ):

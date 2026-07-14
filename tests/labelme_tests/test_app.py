@@ -1057,13 +1057,109 @@ def test_track_modification_swap_id_handles_label_case_change(qtbot, monkeypatch
 
         win.DELETION()
 
-        for image_file in image_files:
+        for index, image_file in enumerate(image_files):
             data = json.load(open(osp.splitext(image_file)[0] + ".json"))
             source, destination = data["shapes"]
-            assert source["track_id"] == "12"
-            assert source["group_id"] == 12
-            assert destination["track_id"] == "11"
-            assert destination["group_id"] == 11
+            if index == 0:
+                assert source["track_id"] == "12"
+                assert source["group_id"] == 12
+                assert destination["track_id"] == "11"
+                assert destination["group_id"] == 11
+            else:
+                assert source["label"] == "person"
+                assert source["track_id"] == "11"
+                assert source["group_id"] == 11
+                assert destination["track_id"] == "12"
+                assert destination["group_id"] == 12
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
+def test_track_modification_swap_id_keeps_different_case_tracks_separate(
+    qtbot, monkeypatch
+):
+    class AcceptedSwapIDDialog:
+        def __init__(self, parent=None):
+            self.start_frame_cell = QtWidgets.QLineEdit("1")
+            self.end_frame_cell = QtWidgets.QLineEdit("2")
+            self.ID_cell = QtWidgets.QLineEdit("5")
+            self.label_cell = QtWidgets.QLineEdit("Person")
+            self.new_ID_cell = QtWidgets.QLineEdit("6")
+            self.new_label_cell = QtWidgets.QLineEdit("")
+
+        @property
+        def mode(self):
+            return "Swap ID"
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        image_files = [
+            osp.join(tmp_dir, "000001.jpg"),
+            osp.join(tmp_dir, "000002.jpg"),
+        ]
+        for image_file in image_files:
+            shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+
+        shapes = [
+            dict(
+                label=label,
+                group_id=track_id,
+                track_id=str(track_id),
+                points=points,
+                shape_type="rectangle",
+                flags={},
+                description=None,
+                mask=None,
+            )
+            for label, track_id, points in [
+                ("Person", 5, [(10, 10), (20, 20)]),
+                ("Person", 6, [(30, 30), (40, 40)]),
+                ("person", 5, [(50, 50), (60, 60)]),
+                ("person", 6, [(70, 70), (80, 80)]),
+            ]
+        ]
+        for image_file in image_files:
+            LabelFile().save(
+                filename=osp.splitext(image_file)[0] + ".json",
+                shapes=[shape.copy() for shape in shapes],
+                imagePath=osp.basename(image_file),
+                imageData=None,
+                imageHeight=10,
+                imageWidth=10,
+                flags={},
+            )
+
+        config = labelme.config.get_default_config()
+        win = labelme.app.MainWindow(config=config)
+        qtbot.addWidget(win)
+        win._imageListCache = image_files
+        win.lastOpenDir = tmp_dir
+        win.image = QtGui.QImage(10, 10, QtGui.QImage.Format_RGB32)
+        win.loadFile = lambda filename=None: None
+        win.informationMessage = lambda title, message: None
+        win.errorMessage = lambda title, message: pytest.fail(message)
+
+        monkeypatch.setattr(labelme.app, "DeletionDialog", AcceptedSwapIDDialog)
+
+        win.DELETION()
+
+        for image_file in image_files:
+            data = json.load(open(osp.splitext(image_file)[0] + ".json"))
+            upper_source, upper_destination, lower_source, lower_destination = data[
+                "shapes"
+            ]
+            assert upper_source["track_id"] == "6"
+            assert upper_source["group_id"] == 6
+            assert upper_destination["track_id"] == "5"
+            assert upper_destination["group_id"] == 5
+            assert lower_source["track_id"] == "5"
+            assert lower_source["group_id"] == 5
+            assert lower_destination["track_id"] == "6"
+            assert lower_destination["group_id"] == 6
     finally:
         shutil.rmtree(tmp_dir)
 
