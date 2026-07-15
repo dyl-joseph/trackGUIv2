@@ -60,7 +60,7 @@ TrackMe annotation format is compatible with LabelMe annotation format (.json) w
 
 13. **Track Forward (CSRT)** — Select a rectangle bounding box and press **Ctrl+T** (or Track > Track Forward (CSRT)) to propagate it across subsequent frames using OpenCV's CSRT tracker. Stops automatically if tracking confidence drops (`labelme/app.py`).
 
-14. **Track Forward (BoTSORT)** — Select a rectangle and press **Ctrl+Shift+T** (or Track > Track Forward (BoTSORT)). Uses YOLO (yolo26x.pt) for detection and BoTSORT for multi-object association. IOU-matches the user's bbox to a YOLO detection, then follows that track across frames. More robust than CSRT for occlusion and scale changes. Includes optional "Refine with EfficientSAM" checkbox to tighten each tracked bbox using AI segmentation (`labelme/app.py`, `labelme/track_algo/botsort_tracker.py`).
+14. **Track Forward (BoTSORT)** — Select a rectangle and press **Ctrl+Shift+T** (or Track > Track Forward (BoTSORT)). Uses Ultralytics' cacheable `yolo11n.pt` download for detection and BoTSORT for multi-object association; clean installations no longer depend on an ignored repository-local weight file. IOU-matches the user's bbox to a YOLO detection, then follows that track across frames. More robust than CSRT for occlusion and scale changes. Includes optional "Refine with EfficientSAM" checkbox to tighten each tracked bbox using AI segmentation (`labelme/app.py`, `labelme/track_algo/botsort_tracker.py`).
 
 15. **Refine Bbox (AI)** — Select one or more rectangles and press **R** (or Track > Refine Bbox (AI)). Uses EfficientSAM with a 5-point box prompt (4 corners + center) to generate a segmentation mask, then extracts a tighter bounding box clipped to the original region. Works with any bbox source — BoTSORT, CSRT, manual, or SORT (`labelme/app.py`, `labelme/ai/efficient_sam.py`).
 
@@ -89,7 +89,7 @@ pip install -e .
 ### Option B: Fresh install
 
 ```bash
-conda create --name=trackGUI python=3.8
+conda create --name=trackGUI python=3.9
 conda activate trackGUI
 pip install -e .
 ```
@@ -107,6 +107,16 @@ labelme
 
 1. Click **Open Dir** (or use the keyboard shortcut) to open a directory.
 2. If your images are in a subdirectory (e.g., `my_project/video0007/`) and your JSON annotations are in the parent directory (`my_project/`), open the **parent directory**. The app will recursively find images in subdirectories and match them with JSON files in the opened directory.
+
+### Annotation storage safety
+
+- JSON writes are staged, flushed, and atomically replaced. Multi-frame tracking,
+  interpolation, and modification operations validate all outputs before committing.
+- When an output directory is configured, image subdirectories are mirrored there
+  (for example, `images/camera1/frame.jpg` becomes
+  `annotations/camera1/frame.json`), preventing duplicate basenames from colliding.
+- Legacy flat output files are read only when the basename is unambiguous and are
+  migrated to the nested path on the next save.
 
 ### Drawing and editing annotations
 

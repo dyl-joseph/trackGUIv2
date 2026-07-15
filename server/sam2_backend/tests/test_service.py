@@ -56,7 +56,7 @@ def test_point_prompt_returns_bbox_from_best_mask():
         label=1,
     )
 
-    assert response["bbox"] == [3.0, 2.0, 6.0, 4.0]
+    assert response["bbox"] == [3.0, 2.0, 7.0, 5.0]
     assert response["score"] == 0.75
     assert response["model"] == "sam2.1"
 
@@ -78,3 +78,73 @@ def test_mask_to_bbox_rejects_empty_mask():
 
     assert exc_info.value.status_code == 422
     assert exc_info.value.detail == "SAM2 returned an empty mask."
+
+
+def test_register_image_enforces_upload_and_decoded_pixel_limits():
+    upload_limited = Sam2Service(
+        predictor=FakePredictor(np.zeros((1, 1), dtype=bool)),
+        max_upload_bytes=2,
+    )
+    with pytest.raises(Sam2ServiceError) as upload_error:
+        upload_limited.register_image(b"123")
+    assert upload_error.value.status_code == 413
+
+    pixel_limited = Sam2Service(
+        predictor=FakePredictor(np.zeros((3, 3), dtype=bool)),
+        max_pixels=8,
+    )
+    with pytest.raises(Sam2ServiceError) as pixel_error:
+        pixel_limited.register_image(_image_bytes(width=3, height=3))
+    assert pixel_error.value.status_code == 413
+
+
+def test_image_cache_evicts_least_recently_used_frame():
+    service = Sam2Service(
+        predictor=FakePredictor(np.zeros((6, 8), dtype=bool)),
+        max_cached_images=2,
+    )
+    first = service.register_image(_image_bytes(width=8, height=6))
+    second = service.register_image(_image_bytes(width=9, height=6))
+    service.register_image(_image_bytes(width=10, height=6))
+
+    with pytest.raises(Sam2ServiceError, match="Unknown image_id") as exc_info:
+        service.point_prompt(first["image_id"], 1, 1)
+
+    assert exc_info.value.status_code == 404
+    assert second["image_id"] in service._images
+
+
+@pytest.mark.parametrize(
+    "masks,scores,detail",
+    [
+        (np.empty((0, 3, 3)), np.empty(0), "invalid shape"),
+        (np.zeros((1, 3, 3)), np.empty(0), "counts do not match"),
+        (np.zeros((2, 3, 3)), np.array([0.5]), "counts do not match"),
+        (np.zeros((1, 3, 3)), np.array([np.nan]), "non-finite"),
+        (np.array([[["bad"]]]), np.array([0.5]), "non-numeric"),
+    ],
+)
+def test_select_mask_rejects_malformed_model_outputs(masks, scores, detail):
+    service = Sam2Service(predictor=FakePredictor(np.zeros((3, 3))))
+
+    with pytest.raises(Sam2ServiceError, match=detail):
+        service._select_mask(masks, scores)
+
+
+def test_readiness_distinguishes_loaded_predictor_from_missing_configuration():
+    ready = Sam2Service(predictor=FakePredictor(np.zeros((2, 2), dtype=bool)))
+    not_ready = Sam2Service()
+
+    assert ready.readiness()["ready"] is True
+    assert not_ready.health()["status"] == "ok"
+    assert not_ready.readiness()["ready"] is False
+
+
+def test_point_prompt_rejects_boolean_label_and_invalid_image_id():
+    service = Sam2Service(predictor=FakePredictor(np.ones((6, 8), dtype=bool)))
+    registered = service.register_image(_image_bytes(width=8, height=6))
+
+    with pytest.raises(Sam2ServiceError, match="label"):
+        service.point_prompt(registered["image_id"], 1, 1, label=True)
+    with pytest.raises(Sam2ServiceError, match="image_id"):
+        service.point_prompt([], 1, 1)

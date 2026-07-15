@@ -1,4 +1,4 @@
-import imgviz
+import numpy as np
 from qtpy import QtCore
 from qtpy import QtGui
 from qtpy import QtWidgets
@@ -34,6 +34,7 @@ class Canvas(QtWidgets.QWidget):
     vertexSelected = QtCore.Signal(bool)
     pointPromptRequested = QtCore.Signal(QtCore.QPointF)
     pointPromptCancelled = QtCore.Signal()
+    aiPredictionFailed = QtCore.Signal(str)
 
     CREATE, EDIT = 0, 1
 
@@ -108,6 +109,13 @@ class Canvas(QtWidgets.QWidget):
         self.setFocusPolicy(QtCore.Qt.WheelFocus)
 
         self._ai_model = None
+        self._ai_preview_key = None
+        self._ai_preview_value = None
+        self._ai_preview_pending = None
+        self._ai_preview_timer = QtCore.QTimer(self)
+        self._ai_preview_timer.setInterval(75)
+        self._ai_preview_timer.setSingleShot(True)
+        self._ai_preview_timer.timeout.connect(self._refreshAiPreview)
 
     def fillDrawing(self):
         return self._fill_drawing
@@ -152,22 +160,94 @@ class Canvas(QtWidgets.QWidget):
         self._ai_model.set_image(
             image=labelme.utils.img_qt_to_arr(self.pixmap.toImage())
         )
+        self._clearAiPreview()
+
+    def _clearAiPreview(self):
+        self._ai_preview_timer.stop()
+        self._ai_preview_key = None
+        self._ai_preview_value = None
+        self._ai_preview_pending = None
+
+    def _aiPredictionKey(self, prediction_type, points, point_labels):
+        return (
+            id(self._ai_model),
+            prediction_type,
+            tuple((float(point.x()), float(point.y())) for point in points),
+            tuple(point_labels),
+        )
+
+    def _runAiPrediction(self, prediction_type, points, point_labels):
+        if self._ai_model is None:
+            raise RuntimeError("The AI model is not initialized.")
+        coordinates = [[point.x(), point.y()] for point in points]
+        if prediction_type == "polygon":
+            return self._ai_model.predict_polygon_from_points(
+                points=coordinates, point_labels=point_labels
+            )
+        return self._ai_model.predict_mask_from_points(
+            points=coordinates, point_labels=point_labels
+        )
+
+    def _predictAi(self, prediction_type, points, point_labels):
+        key = self._aiPredictionKey(prediction_type, points, point_labels)
+        if key == self._ai_preview_key:
+            return self._ai_preview_value
+        value = self._runAiPrediction(prediction_type, points, point_labels)
+        self._ai_preview_key = key
+        self._ai_preview_value = value
+        return value
+
+    def _requestAiPreview(self, prediction_type, points, point_labels):
+        key = self._aiPredictionKey(prediction_type, points, point_labels)
+        if key == self._ai_preview_key:
+            return self._ai_preview_value
+        if self._ai_preview_pending is None or self._ai_preview_pending[0] != key:
+            self._ai_preview_pending = (
+                key,
+                prediction_type,
+                [QtCore.QPointF(point) for point in points],
+                list(point_labels),
+            )
+            self._ai_preview_timer.start()
+        return None
+
+    def _refreshAiPreview(self):
+        pending = self._ai_preview_pending
+        self._ai_preview_pending = None
+        if pending is None:
+            return
+        key, prediction_type, points, point_labels = pending
+        try:
+            value = self._runAiPrediction(prediction_type, points, point_labels)
+        except Exception as error:
+            self.aiPredictionFailed.emit(str(error))
+            return
+        self._ai_preview_key = key
+        self._ai_preview_value = value
+        self.update()
 
     def releaseAiModel(self):
         if self._ai_model is None:
             return
         close = getattr(self._ai_model, "close", None)
-        if close is not None:
-            close()
-        self._ai_model = None
+        try:
+            if close is not None:
+                close()
+        except Exception:
+            logger.exception("Failed to release AI model")
+        finally:
+            self._ai_model = None
+            self._clearAiPreview()
 
     def storeShapes(self):
         shapesBackup = []
         for shape in self.shapes:
             shapesBackup.append(shape.copy())
-        if len(self.shapesBackups) > self.num_backups:
-            self.shapesBackups = self.shapesBackups[-self.num_backups - 1 :]
         self.shapesBackups.append(shapesBackup)
+        if self.num_backups <= 0:
+            self.shapesBackups = []
+        elif len(self.shapesBackups) > self.num_backups:
+            self.shapesBackups = self.shapesBackups[-self.num_backups :]
 
     @property
     def isShapeRestorable(self):
@@ -851,11 +931,10 @@ class Canvas(QtWidgets.QWidget):
                 point=self.line.points[1],
                 label=self.line.point_labels[1],
             )
-            points = self._ai_model.predict_polygon_from_points(
-                points=[[point.x(), point.y()] for point in drawing_shape.points],
-                point_labels=drawing_shape.point_labels,
+            points = self._requestAiPreview(
+                "polygon", drawing_shape.points, drawing_shape.point_labels
             )
-            if len(points) > 2:
+            if points is not None and len(points) > 2:
                 drawing_shape.setShapeRefined(
                     shape_type="polygon",
                     points=[QtCore.QPointF(point[0], point[1]) for point in points],
@@ -870,19 +949,23 @@ class Canvas(QtWidgets.QWidget):
                 point=self.line.points[1],
                 label=self.line.point_labels[1],
             )
-            mask = self._ai_model.predict_mask_from_points(
-                points=[[point.x(), point.y()] for point in drawing_shape.points],
-                point_labels=drawing_shape.point_labels,
+            mask = self._requestAiPreview(
+                "mask", drawing_shape.points, drawing_shape.point_labels
             )
-            y1, x1, y2, x2 = imgviz.instances.masks_to_bboxes([mask])[0].astype(int)
-            drawing_shape.setShapeRefined(
-                shape_type="mask",
-                points=[QtCore.QPointF(x1, y1), QtCore.QPointF(x2, y2)],
-                point_labels=[1, 1],
-                mask=mask[y1 : y2 + 1, x1 : x2 + 1],
-            )
-            drawing_shape.selected = True
-            drawing_shape.paint(p)
+            if mask is not None:
+                mask = np.asarray(mask, dtype=bool)
+                if mask.ndim == 2 and mask.any():
+                    y1, x1, y2, x2 = labelme.utils.masks_to_bboxes(mask[None])[
+                        0
+                    ].astype(int)
+                    drawing_shape.setShapeRefined(
+                        shape_type="mask",
+                        points=[QtCore.QPointF(x1, y1), QtCore.QPointF(x2, y2)],
+                        point_labels=[1, 1],
+                        mask=mask[y1:y2, x1:x2],
+                    )
+                    drawing_shape.selected = True
+                    drawing_shape.paint(p)
 
         p.end()
 
@@ -908,10 +991,12 @@ class Canvas(QtWidgets.QWidget):
         if self.createMode == "ai_polygon":
             # convert points to polygon by an AI model
             assert self.current.shape_type == "points"
-            points = self._ai_model.predict_polygon_from_points(
-                points=[[point.x(), point.y()] for point in self.current.points],
-                point_labels=self.current.point_labels,
+            points = self._predictAi(
+                "polygon", self.current.points, self.current.point_labels
             )
+            if len(points) < 3:
+                self.aiPredictionFailed.emit("The AI model returned no polygon.")
+                return
             self.current.setShapeRefined(
                 points=[QtCore.QPointF(point[0], point[1]) for point in points],
                 point_labels=[1] * len(points),
@@ -920,22 +1005,26 @@ class Canvas(QtWidgets.QWidget):
         elif self.createMode == "ai_mask":
             # convert points to mask by an AI model
             assert self.current.shape_type == "points"
-            mask = self._ai_model.predict_mask_from_points(
-                points=[[point.x(), point.y()] for point in self.current.points],
-                point_labels=self.current.point_labels,
+            mask = self._predictAi(
+                "mask", self.current.points, self.current.point_labels
             )
-            y1, x1, y2, x2 = imgviz.instances.masks_to_bboxes([mask])[0].astype(int)
+            mask = np.asarray(mask, dtype=bool)
+            if mask.ndim != 2 or not mask.any():
+                self.aiPredictionFailed.emit("The AI model returned an empty mask.")
+                return
+            y1, x1, y2, x2 = labelme.utils.masks_to_bboxes(mask[None])[0].astype(int)
             self.current.setShapeRefined(
                 shape_type="mask",
                 points=[QtCore.QPointF(x1, y1), QtCore.QPointF(x2, y2)],
                 point_labels=[1, 1],
-                mask=mask[y1 : y2 + 1, x1 : x2 + 1],
+                mask=mask[y1:y2, x1:x2],
             )
         self.current.close()
 
         self.shapes.append(self.current)
         self.storeShapes()
         self.current = None
+        self._clearAiPreview()
         self.setHiding(False)
         self.newShape.emit()
         self.update()
@@ -1119,6 +1208,7 @@ class Canvas(QtWidgets.QWidget):
             self._ai_model.set_image(
                 image=labelme.utils.img_qt_to_arr(self.pixmap.toImage())
             )
+            self._clearAiPreview()
         if clear_shapes:
             self.shapes = []
         self.update()
@@ -1149,8 +1239,10 @@ class Canvas(QtWidgets.QWidget):
     def restoreCursor(self):
         QtWidgets.QApplication.restoreOverrideCursor()
 
-    def resetState(self):
+    def resetState(self, release_ai_model=True):
         self.cancelPointPrompt(emit_signal=False)
+        if release_ai_model:
+            self.releaseAiModel()
         self.restoreCursor()
         self.pixmap = None
         self.shapes = []
@@ -1169,4 +1261,5 @@ class Canvas(QtWidgets.QWidget):
         self.prevhResizeEdge = None
         self.movingShape = False
         self.shapesBackups = []
+        self._clearAiPreview()
         self.update()

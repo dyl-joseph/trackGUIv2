@@ -226,9 +226,7 @@ def test_brightness_contrast_persists_across_video_frames(qtbot, monkeypatch):
 
 
 @pytest.mark.gui
-def test_brightness_contrast_does_not_carry_to_new_video_by_default(
-    qtbot, monkeypatch
-):
+def test_brightness_contrast_does_not_carry_to_new_video_by_default(qtbot, monkeypatch):
     first_dir = tempfile.mkdtemp()
     second_dir = tempfile.mkdtemp()
     try:
@@ -476,6 +474,22 @@ def test_keyboard_bbox_move_autosaves_before_frame_change(qtbot):
 
 
 @pytest.mark.gui
+def test_forward_tracking_actions_disable_on_final_frame(qtbot, tmp_path):
+    _copy_test_image_sequence(str(tmp_path))
+    win = labelme.app.MainWindow(filename=str(tmp_path))
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+
+    assert win.actions.trackForward.isEnabled()
+    assert win.actions.trackForwardBoTSORT.isEnabled()
+
+    win.openNextImg()
+
+    assert not win.actions.trackForward.isEnabled()
+    assert not win.actions.trackForwardBoTSORT.isEnabled()
+
+
+@pytest.mark.gui
 def test_MainWindow_annotate_jpg(qtbot):
     tmp_dir = tempfile.mkdtemp()
     input_file = osp.join(data_dir, "raw/2011_000003.jpg")
@@ -645,6 +659,7 @@ def test_hosted_sam2_point_prompt_adds_bbox_with_existing_popup(qtbot):
     assert win.labelDialog.popups == 1
     assert win.IDDialog.history == ["1"]
     assert win._save_timer.isActive()
+    win.setClean()
 
 
 @pytest.mark.gui
@@ -690,6 +705,41 @@ def test_hosted_sam2_prompt_failure_creates_no_bbox(qtbot):
 
     assert errors == [("Hosted SAM2", "prompt failed")]
     assert win.canvas.shapes == []
+
+
+@pytest.mark.gui
+def test_hosted_sam2_reregisters_once_after_backend_cache_loss(qtbot):
+    class RestartingClient(FakeHostedSam2Client):
+        def register_image(self, image_data, client_frame_key=None):
+            response = super().register_image(image_data, client_frame_key)
+            response["image_id"] = "image-{}".format(len(self.register_calls))
+            return response
+
+        def point_prompt(self, image_id, x, y, label=1):
+            self.prompt_calls.append((image_id, x, y, label))
+            if len(self.prompt_calls) == 1:
+                raise HostedSam2Error("Unknown image_id.", status_code=404)
+            return {"bbox": list(self.bbox), "score": 0.9, "model": "fake"}
+
+    img_file = osp.join(data_dir, "raw/2011_000003.jpg")
+    config = labelme.config.get_default_config()
+    config["hosted_sam2"]["url"] = "http://sam2.example"
+    win = labelme.app.MainWindow(config=config, filename=img_file)
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    client = RestartingClient()
+    win._hosted_sam2_client = client
+    win.labelDialog = FakeLabelDialog()
+    win.IDDialog = FailingIDDialog()
+
+    win.startHostedSam2PointPrompt()
+    qtbot.waitUntil(lambda: len(client.register_calls) == 1)
+    win.canvas.pointPromptRequested.emit(QtCore.QPointF(20, 25))
+    qtbot.waitUntil(lambda: len(win.canvas.shapes) == 1)
+
+    assert len(client.register_calls) == 2
+    assert [call[0] for call in client.prompt_calls] == ["image-1", "image-2"]
+    win.setClean()
 
 
 def test_load_image_file_returns_raw_jpeg_when_no_orientation():
@@ -794,7 +844,7 @@ def test_track_modification_reject_does_not_change_labels(qtbot, monkeypatch):
                 flags={},
             )
 
-        before = json.load(open(osp.splitext(image_file)[0] + ".json"))
+        before = _read_json(osp.splitext(image_file)[0] + ".json")
 
         config = labelme.config.get_default_config()
         win = labelme.app.MainWindow(config=config)
@@ -807,7 +857,7 @@ def test_track_modification_reject_does_not_change_labels(qtbot, monkeypatch):
 
         win.DELETION()
 
-        after = json.load(open(osp.splitext(image_file)[0] + ".json"))
+        after = _read_json(osp.splitext(image_file)[0] + ".json")
         assert after == before
     finally:
         shutil.rmtree(tmp_dir)
@@ -886,7 +936,7 @@ def test_track_modification_swap_id_updates_without_deleting(qtbot, monkeypatch)
         win.DELETION()
 
         for image_file in image_files:
-            data = json.load(open(osp.splitext(image_file)[0] + ".json"))
+            data = _read_json(osp.splitext(image_file)[0] + ".json")
             assert len(data["shapes"]) == 2
             assert data["shapes"][0]["label"] == "person"
             assert data["shapes"][0]["track_id"] == "9"
@@ -970,7 +1020,7 @@ def test_track_modification_swap_id_exchanges_existing_track(qtbot, monkeypatch)
         win.DELETION()
 
         for image_file in image_files:
-            data = json.load(open(osp.splitext(image_file)[0] + ".json"))
+            data = _read_json(osp.splitext(image_file)[0] + ".json")
             assert len(data["shapes"]) == 2
             assert data["shapes"][0]["track_id"] == "9"
             assert data["shapes"][0]["group_id"] == 9
@@ -1058,7 +1108,7 @@ def test_track_modification_swap_id_handles_label_case_change(qtbot, monkeypatch
         win.DELETION()
 
         for index, image_file in enumerate(image_files):
-            data = json.load(open(osp.splitext(image_file)[0] + ".json"))
+            data = _read_json(osp.splitext(image_file)[0] + ".json")
             source, destination = data["shapes"]
             if index == 0:
                 assert source["track_id"] == "12"
@@ -1148,7 +1198,7 @@ def test_track_modification_swap_id_keeps_different_case_tracks_separate(
         win.DELETION()
 
         for image_file in image_files:
-            data = json.load(open(osp.splitext(image_file)[0] + ".json"))
+            data = _read_json(osp.splitext(image_file)[0] + ".json")
             upper_source, upper_destination, lower_source, lower_destination = data[
                 "shapes"
             ]
@@ -1165,9 +1215,7 @@ def test_track_modification_swap_id_keeps_different_case_tracks_separate(
 
 
 @pytest.mark.gui
-def test_track_modification_remove_box_with_new_id_does_not_delete(
-    qtbot, monkeypatch
-):
+def test_track_modification_remove_box_with_new_id_does_not_delete(qtbot, monkeypatch):
     class MisconfiguredRemoveDialog:
         def __init__(self, parent=None):
             self.start_frame_cell = QtWidgets.QLineEdit("1")
@@ -1215,7 +1263,7 @@ def test_track_modification_remove_box_with_new_id_does_not_delete(
             )
 
         first_json = osp.splitext(image_files[0])[0] + ".json"
-        before = json.load(open(first_json))
+        before = _read_json(first_json)
 
         config = labelme.config.get_default_config()
         win = labelme.app.MainWindow(config=config)
@@ -1231,7 +1279,7 @@ def test_track_modification_remove_box_with_new_id_does_not_delete(
 
         win.DELETION()
 
-        after = json.load(open(first_json))
+        after = _read_json(first_json)
         assert after == before
         assert errors == [
             (
@@ -1242,3 +1290,249 @@ def test_track_modification_remove_box_with_new_id_does_not_delete(
         ]
     finally:
         shutil.rmtree(tmp_dir)
+
+
+@pytest.mark.gui
+def test_autosave_marks_dirty_immediately_and_failed_save_blocks_navigation(
+    qtbot, tmp_path, monkeypatch
+):
+    image_file = tmp_path / "frame.jpg"
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    config = labelme.config.get_default_config()
+    win = labelme.app.MainWindow(config=config, filename=str(image_file))
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    shape = Shape(label="person", track_id="1", shape_type="rectangle", flags={})
+    shape.points = [QtCore.QPointF(1, 1), QtCore.QPointF(5, 5)]
+    shape.point_labels = [1, 1]
+    win.loadShapes([shape])
+
+    win.setDirty()
+
+    assert win.dirty
+    assert win._save_timer.isActive()
+    monkeypatch.setattr(win, "saveLabels", lambda _filename: False)
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QtWidgets.QMessageBox.Save,
+    )
+
+    assert not win.mayContinue()
+    assert win.dirty
+    win.setClean()
+
+
+@pytest.mark.gui
+def test_discard_after_autosave_failure_clears_pending_retry(
+    qtbot, tmp_path, monkeypatch
+):
+    image_file = tmp_path / "frame.jpg"
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    win = labelme.app.MainWindow(
+        config=labelme.config.get_default_config(), filename=str(image_file)
+    )
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    save_attempts = []
+    monkeypatch.setattr(
+        win, "saveLabels", lambda filename: save_attempts.append(filename) and False
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QtWidgets.QMessageBox.Discard,
+    )
+
+    win.setDirty()
+
+    assert win.mayContinue()
+    assert len(save_attempts) == 1
+    assert win._pending_auto_save_target is None
+    assert win._flushPendingAutoSave()
+    assert len(save_attempts) == 1
+    win.setClean()
+
+
+@pytest.mark.gui
+def test_filename_search_only_filters_rows_and_keeps_displayed_frame(qtbot, tmp_path):
+    first = QtGui.QImage(10, 5, QtGui.QImage.Format_RGB32)
+    second = QtGui.QImage(20, 5, QtGui.QImage.Format_RGB32)
+    first.save(str(tmp_path / "a.png"))
+    second.save(str(tmp_path / "b.png"))
+    win = labelme.app.MainWindow(filename=str(tmp_path))
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    win.openNextImg()
+    assert osp.basename(win.filename) == "b.png"
+    assert win.image.width() == 20
+
+    win.fileSearch.setText("a\\.png$")
+
+    assert osp.basename(win.filename) == "b.png"
+    assert osp.basename(win.imagePath) == "b.png"
+    assert win.image.width() == 20
+    assert not win.fileListWidget.item(0).isHidden()
+    assert win.fileListWidget.item(1).isHidden()
+
+
+@pytest.mark.gui
+def test_failed_file_load_keeps_previous_frame_state(qtbot, tmp_path):
+    image_file = tmp_path / "frame.jpg"
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    invalid_label = tmp_path / "broken.json"
+    invalid_label.write_text("{not valid json", encoding="utf-8")
+    win = labelme.app.MainWindow(
+        config=labelme.config.get_default_config(), filename=str(image_file)
+    )
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    original_filename = win.filename
+    original_image_path = win.imagePath
+    original_width = win.image.width()
+    errors = []
+    win.errorMessage = lambda title, message: errors.append((title, message))
+
+    assert not win.loadFile(str(invalid_label))
+
+    assert errors
+    assert win.filename == original_filename
+    assert win.imagePath == original_image_path
+    assert win.image.width() == original_width
+
+
+@pytest.mark.gui
+def test_output_directory_saves_duplicate_basenames_in_nested_paths(qtbot, tmp_path):
+    image_root = tmp_path / "images"
+    first = image_root / "camera1" / "frame.jpg"
+    second = image_root / "camera2" / "frame.jpg"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    source = osp.join(data_dir, "raw/2011_000003.jpg")
+    shutil.copy(source, first)
+    shutil.copy(source, second)
+    output = tmp_path / "annotations"
+    config = labelme.config.get_default_config()
+    config["auto_save"] = False
+    win = labelme.app.MainWindow(config=config, output_dir=str(output))
+    qtbot.addWidget(win)
+    win.importDirImages(str(image_root), load=False)
+
+    for image_path, label in [(first, "first"), (second, "second")]:
+        win.loadFile(str(image_path))
+        qtbot.waitUntil(lambda path=str(image_path): win.filename == path)
+        shape = Shape(label=label, track_id=0, shape_type="rectangle", flags={})
+        shape.points = [QtCore.QPointF(1, 1), QtCore.QPointF(5, 5)]
+        shape.point_labels = [1, 1]
+        win.loadShapes([shape])
+        win.setDirty()
+        assert win.saveFile()
+
+    first_label = output / "camera1" / "frame.json"
+    second_label = output / "camera2" / "frame.json"
+    assert LabelFile(str(first_label)).shapes[0]["label"] == "first"
+    assert LabelFile(str(second_label)).shapes[0]["label"] == "second"
+
+
+@pytest.mark.gui
+def test_normal_gui_save_preserves_unknown_metadata_and_track_zero(qtbot, tmp_path):
+    image_file = tmp_path / "frame.jpg"
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    label_file = tmp_path / "frame.json"
+    label_file.write_text(
+        json.dumps(
+            {
+                "version": "legacy",
+                "flags": {"reviewed": True},
+                "shapes": [
+                    {
+                        "label": "person",
+                        "points": [[1, 1], [5, 5]],
+                        "group_id": 7,
+                        "track_id": 0,
+                        "shape_type": "rectangle",
+                        "flags": {"occluded": True},
+                        "description": "kept",
+                        "mask": None,
+                        "confidence": 0.8,
+                        "other_data": "user-value",
+                    }
+                ],
+                "imagePath": image_file.name,
+                "imageData": None,
+                "imageHeight": 375,
+                "imageWidth": 500,
+                "review": {"owner": "qa"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    win = labelme.app.MainWindow(
+        config=labelme.config.get_default_config(), filename=str(label_file)
+    )
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+
+    assert win.saveFile()
+
+    saved = json.loads(label_file.read_text(encoding="utf-8"))
+    assert saved["review"] == {"owner": "qa"}
+    assert saved["flags"] == {"reviewed": True}
+    assert saved["shapes"][0]["track_id"] == 0
+    assert saved["shapes"][0]["confidence"] == 0.8
+    assert saved["shapes"][0]["other_data"] == "user-value"
+
+
+@pytest.mark.gui
+def test_editing_only_a_label_does_not_replace_track_zero_with_group_id(qtbot):
+    class EditLabelDialog:
+        def popUp(self, **_kwargs):
+            return "vehicle", {}, 7, "edited"
+
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    shape = Shape(
+        label="person",
+        group_id=7,
+        track_id=0,
+        shape_type="rectangle",
+        flags={},
+    )
+    shape.points = [QtCore.QPointF(1, 1), QtCore.QPointF(5, 5)]
+    shape.point_labels = [1, 1]
+    win.loadShapes([shape])
+    win.labelDialog = EditLabelDialog()
+
+    win.editLabel(next(iter(win.labelList)))
+
+    assert shape.label == "vehicle"
+    assert shape.group_id == 7
+    assert shape.track_id == 0
+    win.setClean()
+
+
+@pytest.mark.gui
+def test_configured_save_options_are_not_overridden_and_actions_update_config(qtbot):
+    config = labelme.config.get_default_config()
+    config["auto_save"] = False
+    config["store_data"] = True
+    win = labelme.app.MainWindow(config=config)
+    qtbot.addWidget(win)
+
+    assert not win.actions.saveAuto.isChecked()
+    assert win.actions.saveWithImageData.isChecked()
+
+    win.actions.saveAuto.trigger()
+    win.actions.saveWithImageData.trigger()
+
+    assert win._config["auto_save"] is True
+    assert win._config["store_data"] is False
+
+
+@pytest.mark.gui
+def test_fresh_window_adds_both_annotation_docks(qtbot):
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+
+    assert win.dockWidgetArea(win.shape_dock) != QtCore.Qt.NoDockWidgetArea
+    assert win.dockWidgetArea(win.id_dock) != QtCore.Qt.NoDockWidgetArea

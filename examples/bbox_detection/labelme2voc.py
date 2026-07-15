@@ -42,7 +42,9 @@ def main():
 
     class_names = []
     class_name_to_id = {}
-    for i, line in enumerate(open(args.labels).readlines()):
+    with open(args.labels, encoding="utf-8") as handle:
+        label_lines = list(handle)
+    for i, line in enumerate(label_lines):
         class_id = i - 1  # starts with -1
         class_name = line.strip()
         class_name_to_id[class_name] = class_id
@@ -59,7 +61,7 @@ def main():
         f.writelines("\n".join(class_names))
     print("Saved class_names:", out_class_names_file)
 
-    for filename in glob.glob(osp.join(args.input_dir, "*.json")):
+    for filename in sorted(glob.glob(osp.join(args.input_dir, "*.json"))):
         print("Generating dataset from:", filename)
 
         label_file = labelme.LabelFile(filename=filename)
@@ -95,7 +97,7 @@ def main():
         for shape in label_file.shapes:
             if shape["shape_type"] != "rectangle":
                 print(
-                    "Skipping shape: label={label}, " "shape_type={shape_type}".format(
+                    "Skipping shape: label={label}, shape_type={shape_type}".format(
                         **shape
                     )
                 )

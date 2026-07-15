@@ -27,7 +27,7 @@ def _compute_iou(box1, box2):
 
 
 class BoTSORTForwardTracker:
-    def __init__(self, model_name="yolo26x.pt", device=None):
+    def __init__(self, model_name="yolo11n.pt", device=None):
         import torch
         from ultralytics import YOLO
 
@@ -52,11 +52,13 @@ class BoTSORTForwardTracker:
             verbose=False,
         )
 
-        if results[0].boxes is None or len(results[0].boxes) == 0:
+        if not results or results[0] is None or results[0].boxes is None:
+            return False
+        if len(results[0].boxes) == 0:
             return False
 
         boxes = results[0].boxes
-        if boxes.id is None:
+        if boxes.id is None or len(boxes.id) != len(boxes):
             return False
 
         best_iou = 0.0
@@ -84,11 +86,15 @@ class BoTSORTForwardTracker:
             verbose=False,
         )
 
-        if results[0].boxes is None or results[0].boxes.id is None:
+        if not results or results[0] is None or results[0].boxes is None:
+            return False, None
+        if results[0].boxes.id is None:
             return False, None
 
         boxes = results[0].boxes
         ids = boxes.id.cpu().numpy()
+        if len(ids) != len(boxes):
+            return False, None
 
         for i in range(len(boxes)):
             if int(ids[i]) == self._matched_track_id:

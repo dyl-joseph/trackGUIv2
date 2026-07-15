@@ -1,11 +1,10 @@
-
 from qtpy import QT_VERSION
 from qtpy import QtCore
-from qtpy import QtGui
 from qtpy import QtWidgets
 
 import labelme.utils
 from labelme.logger import logger
+from labelme.widgets.popup_position import move_to_safe_cursor_position
 
 QT5 = QT_VERSION[0] == "5"
 
@@ -156,7 +155,7 @@ class IDDialog(QtWidgets.QDialog):
 
         self.edit.setFocus(QtCore.Qt.PopupFocusReason)
         if move:
-            self.move(QtGui.QCursor.pos())
+            move_to_safe_cursor_position(self, self.IDList)
         if self.exec_():
             return self.edit.text()
         else:

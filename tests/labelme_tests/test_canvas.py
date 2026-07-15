@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 from qtpy import QtCore
 from qtpy import QtGui
@@ -57,6 +58,73 @@ def test_rectangle_side_hit_testing_handles_inverted_points():
     assert shape.nearestRectangleEdge(QtCore.QPointF(30, 20), 1) == ("top", 1)
     assert shape.nearestRectangleEdge(QtCore.QPointF(30, 80), 1) == ("bottom", 0)
     assert shape.nearestRectangleEdge(QtCore.QPointF(30, 101), 1) is None
+
+
+def test_mask_hit_testing_rejects_points_outside_mask_bounds():
+    shape = Shape(shape_type="mask", mask=np.ones((2, 2), dtype=bool))
+    shape.points = [QtCore.QPointF(10, 10), QtCore.QPointF(12, 12)]
+
+    assert shape.containsPoint(QtCore.QPointF(10, 10))
+    assert not shape.containsPoint(QtCore.QPointF(0, 0))
+    assert not shape.containsPoint(QtCore.QPointF(9.6, 10))
+    assert not shape.containsPoint(QtCore.QPointF(12, 12))
+
+
+def test_linestrip_nearest_edge_does_not_wrap_last_point_to_first():
+    shape = Shape(shape_type="linestrip")
+    shape.points = [
+        QtCore.QPointF(0, 0),
+        QtCore.QPointF(10, 0),
+        QtCore.QPointF(10, 10),
+    ]
+
+    assert shape.nearestEdge(QtCore.QPointF(5, 5), 0.5) is None
+    assert shape.nearestEdge(QtCore.QPointF(10, 5), 0.5) == 2
+
+
+def test_restoring_ai_prompt_restores_original_mask_state():
+    shape = Shape(shape_type="points", mask=None)
+    shape.points = [QtCore.QPointF(1, 1)]
+    shape.point_labels = [1]
+    shape.setShapeRefined(
+        "mask",
+        [QtCore.QPointF(0, 0), QtCore.QPointF(2, 2)],
+        [1, 1],
+        mask=np.ones((2, 2), dtype=bool),
+    )
+
+    shape.restoreShapeRaw()
+
+    assert shape.shape_type == "points"
+    assert shape.mask is None
+    assert shape.points == [QtCore.QPointF(1, 1)]
+
+
+@pytest.mark.gui
+def test_ai_preview_is_debounced_and_cached_outside_paint(qtbot):
+    class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def predict_polygon_from_points(self, points, point_labels):
+            self.calls += 1
+            return [[0, 0], [2, 0], [2, 2]]
+
+    canvas = Canvas()
+    qtbot.addWidget(canvas)
+    canvas._ai_model = FakeModel()
+    points = [QtCore.QPointF(1, 1)]
+
+    assert canvas._requestAiPreview("polygon", points, [1]) is None
+    assert canvas._ai_model.calls == 0
+    qtbot.waitUntil(lambda: canvas._ai_model.calls == 1, timeout=500)
+
+    assert canvas._requestAiPreview("polygon", points, [1]) == [
+        [0, 0],
+        [2, 0],
+        [2, 2],
+    ]
+    assert canvas._ai_model.calls == 1
 
 
 @pytest.mark.gui

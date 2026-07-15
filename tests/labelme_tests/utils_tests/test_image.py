@@ -2,6 +2,7 @@ import os.path as osp
 
 import numpy as np
 import PIL.Image
+from qtpy import QtGui
 
 from labelme.utils import image as image_module
 
@@ -29,3 +30,15 @@ def test_img_data_to_png_data():
         img_data = f.read()
     png_data = image_module.img_data_to_png_data(img_data)
     assert isinstance(png_data, bytes)
+
+
+def test_img_qt_to_arr_respects_rgb_row_padding():
+    padded_rows = bytes([255, 0, 0, 0, 0, 0, 255, 0])
+    image = QtGui.QImage(padded_rows, 1, 2, 4, QtGui.QImage.Format_RGB888)
+
+    array = image_module.img_qt_to_arr(image)
+
+    np.testing.assert_array_equal(
+        array,
+        np.array([[[255, 0, 0]], [[0, 0, 255]]], dtype=np.uint8),
+    )

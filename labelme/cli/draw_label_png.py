@@ -8,6 +8,23 @@ import numpy as np
 from labelme.logger import logger
 
 
+def describe_label_values(label_values, label_names):
+    invalid_values = [
+        int(value) for value in label_values if value < -1 or value >= len(label_names)
+    ]
+    if invalid_values:
+        raise ValueError(
+            "Label values have no matching names: {}".format(invalid_values)
+        )
+    return [
+        "{}:{}".format(
+            label_value,
+            "__ignore__" if label_value == -1 else label_names[label_value],
+        )
+        for label_value in label_values
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -46,10 +63,7 @@ def main():
     if label_names is not None:
         logger.info(
             "Label names: {}".format(
-                [
-                    "{}:{}".format(label_value, label_names[label_value])
-                    for label_value in unique_label_values
-                ]
+                describe_label_values(unique_label_values, label_names)
             )
         )
 

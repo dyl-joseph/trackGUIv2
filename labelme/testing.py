@@ -9,7 +9,8 @@ import labelme.utils
 def assert_labelfile_sanity(filename):
     assert osp.exists(filename)
 
-    data = json.load(open(filename))
+    with open(filename, encoding="utf-8") as handle:
+        data = json.load(handle)
 
     assert "imagePath" in data
     imageData = data.get("imageData", None)

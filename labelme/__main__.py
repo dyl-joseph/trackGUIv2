@@ -13,6 +13,7 @@ from labelme import __appname__
 from labelme import __version__
 from labelme.app import MainWindow
 from labelme.config import get_config
+from labelme.config import get_user_config_file
 from labelme.logger import logger
 from labelme.utils import newIcon
 
@@ -23,7 +24,7 @@ def main():
     parser.add_argument("--reset-config", action="store_true", help="reset qt config")
     parser.add_argument(
         "--logger-level",
-        default="debug",
+        default=argparse.SUPPRESS,
         choices=["debug", "info", "warning", "fatal", "error"],
         help="logger level",
     )
@@ -35,7 +36,7 @@ def main():
         help="output file or directory (if it ends with .json it is "
         "recognized as file, else as directory)",
     )
-    default_config_file = os.path.join(os.path.expanduser("~"), ".labelmerc")
+    default_config_file = get_user_config_file()
     parser.add_argument(
         "--config",
         dest="config",
@@ -109,8 +110,6 @@ def main():
         print("{0} {1}".format(__appname__, __version__))
         sys.exit(0)
 
-    logger.setLevel(getattr(logging, args.logger_level.upper()))
-
     if hasattr(args, "flags"):
         if os.path.isfile(args.flags):
             with codecs.open(args.flags, "r", encoding="utf-8") as f:
@@ -139,6 +138,7 @@ def main():
     output = config_from_args.pop("output")
     config_file_or_yaml = config_from_args.pop("config")
     config = get_config(config_file_or_yaml, config_from_args)
+    logger.setLevel(getattr(logging, config["logger_level"].upper()))
 
     if not config["labels"] and config["validate_label"]:
         logger.error(
@@ -163,7 +163,7 @@ def main():
     )
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(__appname__)
-    app.setWindowIcon(newIcon("icon"))
+    app.setWindowIcon(newIcon("labels"))
     app.installTranslator(translator)
     win = MainWindow(
         config=config,

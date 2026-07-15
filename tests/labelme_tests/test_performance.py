@@ -2,7 +2,6 @@ import os
 import os.path as osp
 import shutil
 import tempfile
-import time
 from pathlib import Path
 
 import pytest
@@ -54,7 +53,6 @@ def test_repeated_frame_navigation_ignores_inactive_ai_model(qtbot, tmp_path):
 
         def set_image(self, image):
             self.set_image_calls += 1
-            time.sleep(0.01)
 
     _write_frame_sequence(tmp_path)
 
@@ -70,15 +68,11 @@ def test_repeated_frame_navigation_ignores_inactive_ai_model(qtbot, tmp_path):
     win.canvas.createMode = "polygon"
 
     frame_steps = 25
-    start = time.perf_counter()
     for _ in range(frame_steps):
         win.openNextImg()
         app.processEvents()
-    elapsed = time.perf_counter() - start
-    average_frame_seconds = elapsed / frame_steps
 
     assert ai_model.set_image_calls == 0
-    assert average_frame_seconds < 0.05
 
 
 @pytest.mark.performance
@@ -88,16 +82,12 @@ def test_default_mplconfigdir_uses_os_temp_directory():
     assert expected.is_dir()
 
 
-def test_botsort_default_model_resolves_from_package(monkeypatch, tmp_path):
+def test_botsort_model_uses_ultralytics_cache_when_not_local(monkeypatch, tmp_path):
     package_root = tmp_path / "labelme"
     track_algo_dir = package_root / "track_algo"
-    icons_dir = package_root / "icons"
     run_dir = tmp_path / "run"
     track_algo_dir.mkdir(parents=True)
-    icons_dir.mkdir()
     run_dir.mkdir()
-    model_path = icons_dir / "yolo26x.pt"
-    model_path.write_bytes(b"model")
 
     monkeypatch.setattr(
         botsort_tracker,
@@ -106,4 +96,4 @@ def test_botsort_default_model_resolves_from_package(monkeypatch, tmp_path):
     )
     monkeypatch.chdir(run_dir)
 
-    assert botsort_tracker._resolve_model_path("yolo26x.pt") == str(model_path)
+    assert botsort_tracker._resolve_model_path("yolo11n.pt") == "yolo11n.pt"

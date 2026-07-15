@@ -1,9 +1,5 @@
-import distutils.spawn
 import os
 import re
-import shlex
-import subprocess
-import sys
 
 from setuptools import find_packages
 from setuptools import setup
@@ -91,35 +87,6 @@ def get_long_description():
 def main():
     version = get_version()
 
-    if len(sys.argv) > 1 and sys.argv[1] == "release":
-        try:
-            import github2pypi  # NOQA
-        except ImportError:
-            print(
-                "Please install github2pypi\n\n\tpip install github2pypi\n",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        if not distutils.spawn.find_executable("twine"):
-            print(
-                "Please install twine:\n\n\tpip install twine\n",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        commands = [
-            "git push origin main",
-            "git tag v{:s}".format(version),
-            "git push origin --tags",
-            "python setup.py sdist",
-            "twine upload dist/labelme-{:s}.tar.gz".format(version),
-        ]
-        for cmd in commands:
-            print("+ {:s}".format(cmd))
-            subprocess.check_call(shlex.split(cmd))
-        sys.exit(0)
-
     setup(
         name="labelme",
         version=version,
@@ -131,6 +98,7 @@ def main():
         author_email="www.kentaro.wada@gmail.com",
         url="https://github.com/wkentaro/labelme",
         install_requires=get_install_requires(),
+        python_requires=">=3.9",
         license="GPLv3",
         keywords="Image Annotation, Machine Learning",
         classifiers=[
@@ -140,14 +108,11 @@ def main():
             "Natural Language :: English",
             "Operating System :: OS Independent",
             "Programming Language :: Python",
-            "Programming Language :: Python :: 3.5",
-            "Programming Language :: Python :: 3.6",
-            "Programming Language :: Python :: 3.7",
-            "Programming Language :: Python :: 3.8",
             "Programming Language :: Python :: 3.9",
             "Programming Language :: Python :: 3 :: Only",
         ],
         package_data={"labelme": ["icons/*", "config/*.yaml", "translate/*"]},
+        exclude_package_data={"labelme": ["icons/*.pt"]},
         entry_points={
             "console_scripts": [
                 "labelme=labelme.__main__:main",

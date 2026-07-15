@@ -18,11 +18,27 @@ import labelme
 try:
     import pycocotools.mask
 except ImportError:
-    print("Please install pycocotools:\n\n    pip install pycocotools\n")
-    sys.exit(1)
+    pycocotools = None
+
+
+def load_categories(filename):
+    """Return positive COCO category IDs, excluding LabelMe sentinels."""
+    with open(filename, encoding="utf-8") as handle:
+        class_names = [line.strip() for line in handle if line.strip()]
+    class_name_to_id = {}
+    for class_name in class_names:
+        if class_name in {"__ignore__", "_background_", "__background__"}:
+            continue
+        if class_name in class_name_to_id:
+            raise ValueError("Duplicate category name: {}".format(class_name))
+        class_name_to_id[class_name] = len(class_name_to_id) + 1
+    return class_name_to_id
 
 
 def main():
+    if pycocotools is None:
+        print("Please install pycocotools:\n\n    pip install pycocotools\n")
+        sys.exit(1)
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -71,14 +87,8 @@ def main():
         ],
     )
 
-    class_name_to_id = {}
-    for i, line in enumerate(open(args.labels).readlines()):
-        class_id = i - 1  # starts with -1
-        class_name = line.strip()
-        if class_id == -1:
-            assert class_name == "__ignore__"
-            continue
-        class_name_to_id[class_name] = class_id
+    class_name_to_id = load_categories(args.labels)
+    for class_name, class_id in class_name_to_id.items():
         data["categories"].append(
             dict(
                 supercategory=None,
@@ -88,8 +98,8 @@ def main():
         )
 
     out_ann_file = osp.join(args.output_dir, "annotations.json")
-    label_files = glob.glob(osp.join(args.input_dir, "*.json"))
-    for image_id, filename in enumerate(label_files):
+    label_files = sorted(glob.glob(osp.join(args.input_dir, "*.json")))
+    for image_id, filename in enumerate(label_files, start=1):
         print("Generating dataset from:", filename)
 
         label_file = labelme.LabelFile(filename=filename)
@@ -113,12 +123,14 @@ def main():
 
         masks = {}  # for area
         segmentations = collections.defaultdict(list)  # for segmentation
+        requires_rle = collections.defaultdict(bool)
         for shape in label_file.shapes:
             points = shape["points"]
             label = shape["label"]
             group_id = shape.get("group_id")
             shape_type = shape.get("shape_type", "polygon")
-            mask = labelme.utils.shape_to_mask(img.shape[:2], points, shape_type)
+            mask, _ = labelme.utils.shapes_to_label(img.shape[:2], [shape], {label: 1})
+            mask = mask.astype(bool)
 
             if group_id is None:
                 group_id = uuid.uuid1()
@@ -130,25 +142,11 @@ def main():
             else:
                 masks[instance] = mask
 
-            if shape_type == "rectangle":
-                (x1, y1), (x2, y2) = points
-                x1, x2 = sorted([x1, x2])
-                y1, y2 = sorted([y1, y2])
-                points = [x1, y1, x2, y1, x2, y2, x1, y2]
-            if shape_type == "circle":
-                (x1, y1), (x2, y2) = points
-                r = np.linalg.norm([x2 - x1, y2 - y1])
-                # r(1-cos(a/2))<x, a=2*pi/N => N>pi/arccos(1-x/r)
-                # x: tolerance of the gap between the arc and the line segment
-                n_points_circle = max(int(np.pi / np.arccos(1 - 1 / r)), 12)
-                i = np.arange(n_points_circle)
-                x = x1 + r * np.sin(2 * np.pi / n_points_circle * i)
-                y = y1 + r * np.cos(2 * np.pi / n_points_circle * i)
-                points = np.stack((x, y), axis=1).flatten().tolist()
-            else:
+            if shape_type == "polygon" and len(points) >= 3:
                 points = np.asarray(points).flatten().tolist()
-
-            segmentations[instance].append(points)
+                segmentations[instance].append(points)
+            else:
+                requires_rle[instance] = True
         segmentations = dict(segmentations)
 
         for instance, mask in masks.items():
@@ -158,16 +156,21 @@ def main():
             cls_id = class_name_to_id[cls_name]
 
             mask = np.asfortranarray(mask.astype(np.uint8))
-            mask = pycocotools.mask.encode(mask)
-            area = float(pycocotools.mask.area(mask))
-            bbox = pycocotools.mask.toBbox(mask).flatten().tolist()
+            encoded_mask = pycocotools.mask.encode(mask)
+            area = float(pycocotools.mask.area(encoded_mask))
+            bbox = pycocotools.mask.toBbox(encoded_mask).flatten().tolist()
+            if requires_rle[instance]:
+                encoded_mask["counts"] = encoded_mask["counts"].decode("ascii")
+                segmentation = encoded_mask
+            else:
+                segmentation = segmentations[instance]
 
             data["annotations"].append(
                 dict(
-                    id=len(data["annotations"]),
+                    id=len(data["annotations"]) + 1,
                     image_id=image_id,
                     category_id=cls_id,
-                    segmentation=segmentations[instance],
+                    segmentation=segmentation,
                     area=area,
                     bbox=bbox,
                     iscrowd=0,
@@ -176,22 +179,24 @@ def main():
 
         if not args.noviz:
             viz = img
+            if viz.ndim == 2:
+                viz = np.repeat(viz[:, :, None], 3, axis=2)
             if masks:
-                labels, captions, masks = zip(
-                    *[
-                        (class_name_to_id[cnm], cnm, msk)
-                        for (cnm, gid), msk in masks.items()
-                        if cnm in class_name_to_id
-                    ]
-                )
-                viz = imgviz.instances2rgb(
-                    image=img,
-                    labels=labels,
-                    masks=masks,
-                    captions=captions,
-                    font_size=15,
-                    line_width=2,
-                )
+                known_instances = [
+                    (class_name_to_id[cnm], cnm, msk)
+                    for (cnm, _), msk in masks.items()
+                    if cnm in class_name_to_id
+                ]
+                if known_instances:
+                    labels, captions, known_masks = zip(*known_instances)
+                    viz = imgviz.instances2rgb(
+                        image=viz,
+                        labels=labels,
+                        masks=known_masks,
+                        captions=captions,
+                        font_size=15,
+                        line_width=2,
+                    )
             out_viz_file = osp.join(args.output_dir, "Visualization", base + ".jpg")
             imgviz.io.imsave(out_viz_file, viz)
 

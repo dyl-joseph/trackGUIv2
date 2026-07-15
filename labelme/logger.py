@@ -28,17 +28,22 @@ class ColoredFormatter(logging.Formatter):
 
     def format(self, record):
         levelname = record.levelname
+        record.levelname2 = "{:<7}".format(levelname)
+        record.message2 = record.getMessage()
+        record.module2 = record.module
+        record.funcName2 = record.funcName
+        record.lineno2 = record.lineno
         if self.use_color and levelname in COLORS:
 
             def colored(text):
                 return termcolor.colored(
                     text,
                     color=COLORS[levelname],
-                    attrs={"bold": True},
+                    attrs=["bold"],
                 )
 
             record.levelname2 = colored("{:<7}".format(record.levelname))
-            record.message2 = colored(record.msg)
+            record.message2 = colored(record.message2)
 
             asctime2 = datetime.datetime.fromtimestamp(record.created)
             record.asctime2 = termcolor.colored(asctime2, color="green")
@@ -54,8 +59,7 @@ logger.setLevel(logging.INFO)
 
 stream_handler = logging.StreamHandler(sys.stderr)
 handler_format = ColoredFormatter(
-    "%(asctime)s [%(levelname2)s] %(module2)s:%(funcName2)s:%(lineno2)s"
-    "- %(message2)s"
+    "%(asctime)s [%(levelname2)s] %(module2)s:%(funcName2)s:%(lineno2)s- %(message2)s"
 )
 stream_handler.setFormatter(handler_format)
 

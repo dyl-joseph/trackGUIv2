@@ -3,11 +3,11 @@
 import functools
 import hashlib
 import html
-import json
 import math
 import os
 import os.path as osp
 import re
+import threading
 import webbrowser
 
 import cv2  # noqa: F401
@@ -23,15 +23,20 @@ from scipy.optimize import linear_sum_assignment
 from labelme import PY2
 from labelme import __appname__
 from labelme.ai import MODELS
+from labelme.annotation_path import resolve_annotation_path
 from labelme.config import get_config
 from labelme.hosted_sam2_client import HostedSam2Client
 from labelme.hosted_sam2_client import HostedSam2Error
 from labelme.label_file import LabelFile
 from labelme.label_file import LabelFileError
+from labelme.label_file import save_label_files_atomically
 from labelme.logger import logger
 from labelme.shape import Shape
 from labelme.track_algo import KalmanBoxTracker
 from labelme.track_algo import SORT_main
+from labelme.tracking_utils import interpolation_indices
+from labelme.tracking_utils import normalized_rectangle_points
+from labelme.tracking_utils import shape_track_id
 from labelme.widgets import BrightnessContrastDialog
 from labelme.widgets import Canvas
 from labelme.widgets import DeletionDialog
@@ -65,7 +70,7 @@ LABEL_COLORMAP = imgviz.label_colormap()
 
 class HostedSam2RequestWorker(QtCore.QObject):
     finished = QtCore.Signal(object)
-    failed = QtCore.Signal(str)
+    failed = QtCore.Signal(object)
 
     def __init__(self, function, *args, **kwargs):
         super().__init__()
@@ -78,10 +83,37 @@ class HostedSam2RequestWorker(QtCore.QObject):
         try:
             self.finished.emit(self._function(*self._args, **self._kwargs))
         except HostedSam2Error as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(exc)
         except Exception as exc:
             logger.exception("Hosted SAM2 request failed")
-            self.failed.emit(str(exc))
+            self.failed.emit(exc)
+
+
+class CancellableTrackingWorker(QtCore.QObject):
+    finished = QtCore.Signal(object)
+    failed = QtCore.Signal(object)
+    progress = QtCore.Signal(int, str)
+
+    def __init__(self, function):
+        super().__init__()
+        self._function = function
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def _reportProgress(self, value, message):
+        self.progress.emit(int(value), str(message))
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            result = self._function(self._cancel_event, self._reportProgress)
+        except Exception as exc:
+            logger.exception("Forward tracking failed")
+            self.failed.emit(exc)
+        else:
+            self.finished.emit(result)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -105,9 +137,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if config is None:
             config = get_config()
         self._config = config
-
-        self._config["auto_save"] = True
-        self._config["store_data"] = False
 
         # set default shape colors
         Shape.line_color = QtGui.QColor(*self._config["shape"]["line_color"])
@@ -135,6 +164,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dirty = False
 
         self._noSelectionSlot = False
+        self._syncing_visibility = False
 
         self._copied_shapes = None
         self._hosted_sam2_client = HostedSam2Client.from_config(self._config)
@@ -142,6 +172,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hosted_sam2_thread = None
         self._hosted_sam2_worker = None
         self._hosted_sam2_request_active = False
+        self._hosted_sam2_request_context = None
+        self._hosted_sam2_on_success = None
+        self._hosted_sam2_cache_frames = bool(
+            self._config.get("hosted_sam2", {}).get("cache_frames", True)
+        )
+        self._hosted_sam2_max_cached_frames = 8
+        self._close_after_hosted_request = False
+        self._tracking_thread = None
+        self._tracking_worker = None
+        self._tracking_progress = None
+        self._tracking_context = None
+        self._tracking_request_active = False
+        self._close_after_tracking = False
 
         # Main widgets and related state.
         self.labelDialog = LabelDialog(
@@ -184,6 +227,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ID_INPO = ""
         self.label_INPO = ""
         self.INTERPOLATION_list = []
+        self.INTERPOLATION_indices = []
         self.INTERPOLATION_filename = None
         self.navigation_list = NavigationWidget()
         self.navigation_list.button1.clicked.connect(self.OKAY)
@@ -221,9 +265,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.IDList.itemDoubleClicked.connect(self.editID)
         self.IDList.itemChanged.connect(self.IDItemChanged)
         self.IDList.itemDropped.connect(self.IDOrderChanged)
-        self.shape_dock = QtWidgets.QDockWidget(self.tr("Polygon IDs"), self)
-        self.shape_dock.setObjectName("IDs")
-        self.shape_dock.setWidget(self.IDList)
+        self.id_dock = QtWidgets.QDockWidget(self.tr("Polygon IDs"), self)
+        self.id_dock.setObjectName("IDs")
+        self.id_dock.setWidget(self.IDList)
 
         self.uniqLabelList = UniqueLabelQListWidget()
         self.uniqLabelList.setToolTip(
@@ -281,6 +325,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.drawingPolygon.connect(self.toggleDrawingSensitive)
         self.canvas.pointPromptRequested.connect(self._hostedSam2PointPrompt)
         self.canvas.pointPromptCancelled.connect(self._hostedSam2PointPromptCancelled)
+        self.canvas.aiPredictionFailed.connect(
+            lambda message: self.status(message, delay=8000)
+        )
 
         self._theme_mode = self._config.get("theme", self.THEME_SYSTEM)
         self._theme_action_group = QtWidgets.QActionGroup(self)
@@ -288,8 +335,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.setCentralWidget(scrollArea)
 
-        features = QtWidgets.QDockWidget.DockWidgetFeatures()
         for dock in ["flag_dock", "label_dock", "shape_dock", "file_dock"]:
+            features = QtWidgets.QDockWidget.DockWidgetFeatures()
             if self._config[dock]["closable"]:
                 features = features | QtWidgets.QDockWidget.DockWidgetClosable
             if self._config[dock]["floatable"]:
@@ -299,12 +346,15 @@ class MainWindow(QtWidgets.QMainWindow):
             getattr(self, dock).setFeatures(features)
             if self._config[dock]["show"] is False:
                 getattr(self, dock).setVisible(False)
+        self.id_dock.setFeatures(self.shape_dock.features())
+        self.id_dock.setVisible(self._config["shape_dock"]["show"])
 
         self.addDockWidget(Qt.RightDockWidgetArea, self.navigation_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.interpolationrefine_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.flag_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.label_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.shape_dock)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.id_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.file_dock)
 
         # Actions
@@ -383,7 +433,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         saveAuto = action(
             text=self.tr("Save &Automatically"),
-            slot=lambda x: self.actions.saveAuto.setChecked(x),
+            slot=self.enableAutoSave,
             icon="save",
             tip=self.tr("Save automatically"),
             checkable=True,
@@ -972,6 +1022,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.flag_dock.toggleViewAction(),
                 self.label_dock.toggleViewAction(),
                 self.shape_dock.toggleViewAction(),
+                self.id_dock.toggleViewAction(),
                 self.file_dock.toggleViewAction(),
                 None,
                 themeSystem,
@@ -1082,7 +1133,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().show()
 
         if output_file is not None and self._config["auto_save"]:
-            logger.warn(
+            logger.warning(
                 "If `auto_save` argument is True, `output_file` argument "
                 "is ignored and output filename is automatically "
                 "set as IMAGE_BASENAME.json."
@@ -1096,6 +1147,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recentFiles = []
         self.maxRecent = 7
         self.otherData = None
+        self._explicit_label_path = None
+        self._dirty_revision = 0
+        self._pending_auto_save_filename = None
+        self._pending_auto_save_target = None
         self.zoom_level = 100
         self.fit_window = False
         self.zoom_values = {}  # key=filename, value=(zoom_mode, zoom_value)
@@ -1105,7 +1160,10 @@ class MainWindow(QtWidgets.QMainWindow):
             Qt.Vertical: {},
         }  # key=filename, value=scroll_value
 
-        if filename is not None and osp.isdir(filename):
+        initial_directory = (
+            filename if filename is not None and osp.isdir(filename) else None
+        )
+        if initial_directory is not None:
             self.importDirImages(filename, load=False)
         else:
             self.filename = filename
@@ -1131,8 +1189,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.updateFileMenu()
         # Since loading the file may take some time,
         # make sure it runs in the background.
-        if self.filename is not None:
-            self.queueEvent(functools.partial(self.loadFile, self.filename))
+        initial_file = self.filename
+        if initial_directory is not None and self.imageList:
+            initial_file = self.imageList[0]
+        if initial_file is not None:
+            self.queueEvent(functools.partial(self.loadFile, initial_file))
 
         # Callbacks:
         self.zoomWidget.valueChanged.connect(self.paintCanvas)
@@ -1231,39 +1292,144 @@ class MainWindow(QtWidgets.QMainWindow):
         app.setPalette(palette)
         app.setStyleSheet("")
 
-    def _resolveJsonPath(self):
-        if self.labelFile and self.labelFile.filename:
-            return self.labelFile.filename
-        label_file = osp.splitext(self.filename)[0] + ".json"
-        if self.output_dir:
-            return osp.join(self.output_dir, osp.basename(label_file))
-        if self.lastOpenDir:
-            return osp.join(self.lastOpenDir, osp.basename(label_file))
-        return label_file
+    def _resolveJsonPath(self, image_path=None, for_write=True, image_paths=None):
+        current_filename = getattr(self, "filename", None)
+        image_path = image_path or current_filename
+        explicit_label_path = None
+        if image_path == current_filename:
+            explicit_label_path = self._explicit_label_path
+        return resolve_annotation_path(
+            image_path=image_path,
+            output_dir=self.output_dir,
+            image_root=self.lastOpenDir,
+            image_paths=self.imageList if image_paths is None else image_paths,
+            for_write=for_write,
+            explicit_label_path=explicit_label_path,
+        )
+
+    def _loadLabelForImage(self, image_path):
+        path = self._resolveJsonPath(image_path=image_path, for_write=False)
+        if path and osp.isfile(path):
+            return LabelFile(path)
+        return None
+
+    @staticmethod
+    def _relativeImagePath(image_path, annotation_path):
+        image_path = osp.abspath(image_path)
+        try:
+            relative_path = osp.relpath(image_path, osp.dirname(annotation_path))
+        except ValueError:
+            return image_path
+        return relative_path
+
+    def _labelSaveRequest(self, image_path, shapes, label_file=None):
+        destination = self._resolveJsonPath(image_path=image_path, for_write=True)
+        image_height = label_file.imageHeight if label_file else None
+        image_width = label_file.imageWidth if label_file else None
+        if not image_height or not image_width:
+            reader = QtGui.QImageReader(image_path)
+            size = reader.size()
+            if not size.isValid():
+                raise LabelFileError("Cannot read target image: {}".format(image_path))
+            image_width, image_height = size.width(), size.height()
+        image_data = None
+        if label_file and label_file.imageDataEmbedded:
+            image_data = label_file.imageData
+        elif self._config["store_data"]:
+            image_data = LabelFile.load_image_file(image_path)
+            if image_data is None:
+                raise LabelFileError("Cannot embed target image: {}".format(image_path))
+        return dict(
+            filename=destination,
+            shapes=shapes,
+            imagePath=self._relativeImagePath(image_path, destination),
+            imageData=image_data,
+            imageHeight=image_height,
+            imageWidth=image_width,
+            otherData=label_file.otherData if label_file else {},
+            flags=label_file.flags if label_file else {},
+        )
+
+    def _saveLabelBatch(self, requests, title):
+        try:
+            save_label_files_atomically(requests)
+        except LabelFileError as exc:
+            self.errorMessage(title, str(exc))
+            return False
+        for request in requests:
+            image_path = osp.abspath(
+                osp.normpath(
+                    osp.join(osp.dirname(request["filename"]), request["imagePath"])
+                )
+            )
+            items = self.fileListWidget.findItems(image_path, Qt.MatchExactly)
+            for item in items:
+                item.setCheckState(Qt.Checked)
+        return True
 
     def setDirty(self):
         self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
-        if self._config["auto_save"] or self.actions.saveAuto.isChecked():
-            self._save_timer.start()
-            return
         self.dirty = True
+        self._dirty_revision += 1
         self.actions.save.setEnabled(True)
         title = __appname__
         if self.filename is not None:
             title = "{} - {}*".format(title, self.filename)
         self.setWindowTitle(title)
+        if self.filename and (
+            self._config["auto_save"] or self.actions.saveAuto.isChecked()
+        ):
+            self._pending_auto_save_filename = self.filename
+            self._pending_auto_save_target = self._resolveJsonPath(for_write=True)
+            self._save_timer.start()
 
     def _debouncedSave(self):
-        if self.filename:
-            self.saveLabels(self._resolveJsonPath())
+        filename = self._pending_auto_save_filename
+        target = self._pending_auto_save_target
+        revision = self._dirty_revision
+        if not filename or not target:
+            return False
+        if filename != self.filename:
+            logger.error(
+                "Refusing to autosave %r while frame %r is displayed",
+                filename,
+                self.filename,
+            )
+            return False
+        if self.saveLabels(target):
+            if revision == self._dirty_revision:
+                self.setClean()
+            return True
+        return False
 
     def _flushPendingAutoSave(self):
         save_timer = getattr(self, "_save_timer", None)
         if save_timer is not None and save_timer.isActive():
             save_timer.stop()
-            self._debouncedSave()
+        if self.dirty and self._pending_auto_save_target:
+            return self._debouncedSave()
+        return True
+
+    def _ensureSavedForWorkflow(self, title):
+        if not self._flushPendingAutoSave():
+            return False
+        if not self.dirty:
+            return True
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            title,
+            self.tr("Save current-frame edits before running this operation?"),
+            QtWidgets.QMessageBox.Save | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Save,
+        )
+        return answer == QtWidgets.QMessageBox.Save and bool(self.saveFile())
 
     def setClean(self):
+        save_timer = getattr(self, "_save_timer", None)
+        if save_timer is not None:
+            save_timer.stop()
+        self._pending_auto_save_filename = None
+        self._pending_auto_save_target = None
         self.dirty = False
         self.actions.save.setEnabled(False)
         self.actions.createMode.setEnabled(True)
@@ -1277,8 +1443,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.SORT.setEnabled(True)
         self.actions.INPO.setEnabled(True)
         self.actions.DELE.setEnabled(True)
-        self.actions.trackForward.setEnabled(True)
-        self.actions.trackForwardBoTSORT.setEnabled(True)
+        can_track_forward = False
+        if self.filename in self.imageList:
+            can_track_forward = self.imageList.index(self.filename) + 1 < len(
+                self.imageList
+            )
+        self.actions.trackForward.setEnabled(can_track_forward)
+        self.actions.trackForwardBoTSORT.setEnabled(can_track_forward)
         self.actions.refineBboxAI.setEnabled(True)
         self.actions.hostedSam2PointPrompt.setEnabled(True)
         title = __appname__
@@ -1304,15 +1475,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def status(self, message, delay=5000):
         self.statusBar().showMessage(message, delay)
 
-    def resetState(self):
+    def resetState(self, release_ai_model=True):
+        if not self._hosted_sam2_cache_frames:
+            self._hosted_sam2_image_cache.clear()
         self.labelList.clear()
         self.IDList.clear()
         self.filename = None
+        self._explicit_label_path = None
         self.imagePath = None
         self.imageData = None
         self.labelFile = None
         self.otherData = None
-        self.canvas.resetState()
+        self.canvas.resetState(release_ai_model=release_ai_model)
 
     def currentItem(self):
         items_l = self.labelList.selectedItems()
@@ -1452,7 +1626,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = InterpolationRefineInfo_Dialog(
             parent=self,
         )
-        dialog.exec_()
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
 
         self.ir_name = dialog.name
         self.ir_id = dialog.id
@@ -1462,651 +1637,463 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def SORT(self, item=None):
-        def convert(box):
-            w = abs(box[1][0] - box[0][0])
-            h = abs(box[1][1] - box[0][1])
-            return [box[0][0], box[0][1], w, h]
-
+        if not self.imageList or self.filename not in self.imageList:
+            self.errorMessage("Track IDs", "Open a frame sequence before tracking.")
+            return
+        if not self._ensureSavedForWorkflow("Track IDs"):
+            return
+        current_index = self.imageList.index(self.filename)
         dialog = TrackDialog(
-            parent=self,
-        )
-        dialog.exec_()
-
-        # 3 modes
-        # + start by using the current frame's track annotation
-        # + start from scratch without track annotation
-        track_option = dialog.option_value
-
-        # print frame shortage here
-        # ...
-
-        if track_option != 0:
-            # get the index of current item
-            items = self.fileListWidget.selectedItems()
-            item = items[0]
-            currIndex = self.imageList.index(str(item.text()))
-
-            # get label list .json
-            if track_option == 1:  # start from beginning
-                labelList = [
-                    osp.splitext(img_p)[0] + ".json" for img_p in self.imageList
-                ]
-            else:
-                labelList = [
-                    osp.splitext(img_p)[0] + ".json" for img_p in self.imageList
-                ][currIndex:]
-
-            # convert label to Track Evaluation
-            lines = []
-            frame_id = 1
-            for jdx, json_path in enumerate(labelList):
-                if jdx == 0:  # first frame
-                    bboxes = [
-                        [
-                            [
-                                self.IDList[idx].shape().points[0].x(),
-                                self.IDList[idx].shape().points[0].y(),
-                            ],
-                            [
-                                self.IDList[idx].shape().points[1].x(),
-                                self.IDList[idx].shape().points[1].y(),
-                            ],
-                        ]
-                        for idx in range(len(self.IDList))
-                    ]
-                    bboxes_xywh = [convert(bboxes[i]) for i in range(len(bboxes))]
-
-                    if track_option == 2:  # start with current annotation
-                        track_ids = [
-                            self.IDList[idx].text() for idx in range(len(self.IDList))
-                        ]
-                        int_track_ids = [
-                            int(self.IDList[idx].text())
-                            for idx in range(len(self.IDList))
-                        ]
-
-                        if "-1" in track_ids:
-                            self.errorMessage(
-                                "Track IDs",
-                                "You must label all objects' IDs.",
-                            )
-                            return
-                        for box_index in range(len(bboxes_xywh)):
-                            lines.append(
-                                [
-                                    frame_id,
-                                    int(track_ids[box_index]),
-                                    bboxes_xywh[box_index][0],
-                                    bboxes_xywh[box_index][1],
-                                    bboxes_xywh[box_index][2],
-                                    bboxes_xywh[box_index][3],
-                                    1,
-                                    -1,
-                                    -1,
-                                    -1,
-                                ]
-                            )
-                    else:  # start with NO annotation
-                        for box_index in range(len(bboxes_xywh)):
-                            lines.append(
-                                [
-                                    frame_id,
-                                    -1,
-                                    bboxes_xywh[box_index][0],
-                                    bboxes_xywh[box_index][1],
-                                    bboxes_xywh[box_index][2],
-                                    bboxes_xywh[box_index][3],
-                                    1,
-                                    -1,
-                                    -1,
-                                    -1,
-                                ]
-                            )
-                else:  # next frames # all ids are -1
-                    with open(json_path) as file:
-                        data = json.load(file)
-
-                    bboxes = [
-                        data["shapes"][i]["points"] for i in range(len(data["shapes"]))
-                    ]
-                    # need boxes in x,y,w,h
-                    bboxes_xywh = [convert(bboxes[i]) for i in range(len(bboxes))]
-
-                    # frame_id, track_id, x, y, width, height, 1, -1, -1, -1
-                    for box_index in range(len(bboxes_xywh)):
-                        lines.append(
-                            [
-                                frame_id,
-                                -1,
-                                bboxes_xywh[box_index][0],
-                                bboxes_xywh[box_index][1],
-                                bboxes_xywh[box_index][2],
-                                bboxes_xywh[box_index][3],
-                                1,
-                                -1,
-                                -1,
-                                -1,
-                            ]
-                        )
-                frame_id += 1
-            seq_dets = np.array(lines).astype(float)
-
-            mot_tracker = SORT_main(max_age=10, min_hits=0, iou_threshold=0.3)
-            mot_tracker.trackers = []
-            KalmanBoxTracker.count = 0
-            track_results = []
-            if track_option == 2:
-                for idx in range(len(seq_dets[seq_dets[:, 0] == 1])):
-                    dets = seq_dets[seq_dets[:, 0] == 1, 2:7][
-                        idx : idx + 1
-                    ]  # original setting: x,y,w,h top left width height
-                    det_id = seq_dets[seq_dets[:, 0] == 1, 1][idx]
-                    dets[:, 2:4] += dets[
-                        :, 0:2
-                    ]  # convert to [x1,y1,w,h] to [x1,y1,x2,y2]
-                    KalmanBoxTracker.count = max(int_track_ids) + 1
-                    KalmanBoxTracker.id = 0
-                    mot_tracker.trackers.append(KalmanBoxTracker(dets[0], id=det_id))
-
-            for frame in range(int(seq_dets[:, 0].max())):
-                frame += 1  # detection and frame numbers begin at 1
-                dets = seq_dets[
-                    seq_dets[:, 0] == frame, 2:7
-                ]  # original setting: x,y,w,h top left width height
-                dets[:, 2:4] += dets[:, 0:2]  # convert to [x1,y1,w,h] to [x1,y1,x2,y2]
-                trackers = mot_tracker.update(dets)
-
-                for d in trackers:
-                    track_results.append(
-                        [frame, d[4], d[0], d[1], d[2] - d[0], d[3] - d[1]]
-                    )
-            track_results = np.array(track_results).astype(int)
-
-            lf = LabelFile()
-            flags = {}
-            # Edit frame Shape and save
-            for jdx, json_path in enumerate(labelList):
-                loaded_label = LabelFile(json_path)
-                loaded_shape = loaded_label.shapes
-                frame = jdx + 1
-                track_ids = track_results[track_results[:, 0] == frame, 1]
-                track_xy = track_results[track_results[:, 0] == frame, 2:4]
-                shape_xy = [
-                    loaded_shape[idx]["points"][0] for idx in range(len(loaded_shape))
-                ]
-
-                hungarian_matrix = []
-                for adx in range(len(shape_xy)):
-                    row = []
-                    for bdx in range(len(track_xy)):
-                        row.append(np.sum(np.abs(shape_xy[adx] - track_xy[bdx])))
-                    hungarian_matrix.append(row)
-                shape_m, track_m = linear_sum_assignment(np.array(hungarian_matrix))
-
-                for idx in range(len(shape_xy)):
-                    loaded_shape[idx]["track_id"] = str(track_ids[track_m[idx]])
-
-                imagePath = osp.splitext(json_path)[0] + ".jpg"
-                lf.save(
-                    filename=json_path,
-                    shapes=loaded_shape,
-                    imagePath=imagePath,
-                    imageData=None,
-                    imageHeight=self.image.height(),
-                    imageWidth=self.image.width(),
-                    flags=flags,
-                )
-
-            # repaint the current frame
-            self.informationMessage(
-                "Track IDs",
-                "ID Association is completed",
-            )
-            self.loadFile(self.filename)
-
-    def INTERPOLATION(self, item=None):
-        dialog = InterpolationDialog(
-            min_val=0, max_val=len(self.imageList), parent=self
-        )
-        dialog.exec_()
-        # import ipdb; ipdb.set_trace()
-        if (
-            dialog.start_frame_cell.text() == ""
-            or dialog.end_frame_cell.text() == ""
-            or dialog.interval_cell.text() == ""
-            or dialog.ID_cell.text() == ""
-            or dialog.label_cell.text() == ""
-        ):
-            self.errorMessage(
-                "Box Interpolation",
-                "You must fill all the values in the form.",
-            )
-
-            return
-
-        self.start_INP0 = start_frame = int(
-            dialog.start_frame_cell.text().replace(" ", "")
-        )
-        self.end_INP0 = end_frame = int(dialog.end_frame_cell.text().replace(" ", ""))
-        self.interval_INPO = interval = int(
-            dialog.interval_cell.text().replace(" ", "")
-        )
-        self.ID_INPO = dialog.ID_cell.text().replace(" ", "")
-        self.label_INPO = dialog.label_cell.text().replace(" ", "")
-
-        if end_frame - start_frame <= 0:
-            self.errorMessage(
-                "Box Interpolation",
-                "Start frame is higher than End frame.",
-            )
-
-            return
-        elif interval == 0 or interval > (end_frame - start_frame):
-            self.errorMessage(
-                "Box Interpolation",
-                "Input Interval is bigger than Start-End frame gap (or is 0).",
-            )
-
-            return
-        elif end_frame > len(self.imageList):
-            self.errorMessage(
-                "Box Interpolation",
-                "Input End frame is out of the video length.",
-            )
-
-            return
-
-        img_indices = np.linspace(
-            start_frame - 1,
-            end_frame - 1,
-            num=int((end_frame - start_frame + 1) / interval),
-            dtype=int,
-        )
-
-        self.mode = "TRACK INTERPOLATION"
-        self.INTERPOLATION_list = np.array(self.imageList)[img_indices].tolist()
-        self.INTERPOLATION_filename = self.INTERPOLATION_list[0]
-        self.filename = self.INTERPOLATION_filename
-        self.loadFile(self.filename)
-
-    def OKAY(self, item=None):
-        def convert(box):
-            return [box[0][0], box[0][1], box[1][0], box[1][1]]
-
-        def cvt_xyxy2xywh(old_bboxes):
-            new_bboxes = np.zeros(old_bboxes.shape)
-            new_bboxes[:, 0] = (old_bboxes[:, 0] + old_bboxes[:, 2]) / 2
-            new_bboxes[:, 1] = (old_bboxes[:, 1] + old_bboxes[:, 3]) / 2
-            new_bboxes[:, 2] = old_bboxes[:, 2] - old_bboxes[:, 0]
-            new_bboxes[:, 3] = old_bboxes[:, 3] - old_bboxes[:, 1]
-            return new_bboxes
-
-        def cvt_xywh2xyxy(old_bboxes):
-            new_bboxes = np.zeros(old_bboxes.shape)
-            dw = old_bboxes[:, 2] / 2
-            dh = old_bboxes[:, 3] / 2
-            new_bboxes[:, 0] = old_bboxes[:, 0] - dw
-            new_bboxes[:, 1] = old_bboxes[:, 1] - dh
-            new_bboxes[:, 2] = old_bboxes[:, 0] + dw
-            new_bboxes[:, 3] = old_bboxes[:, 1] + dh
-            return new_bboxes
-
-        from sklearn.gaussian_process import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import RationalQuadratic
-
-        if self.mode == "None" or self.mode == "NORMAL":
-            return
-        elif self.mode == "TRACK INTERPOLATION":
-            self.INTERPOLATION_filename = self.INTERPOLATION_list[0]
-            self.filename = self.INTERPOLATION_filename
-            self.loadFile(self.filename)
-
-            # print(self.start_INP0, self.end_INP0, self.ID_INPO, self.label_INPO)
-
-            labelList = [
-                osp.splitext(img_p)[0] + ".json" for img_p in self.INTERPOLATION_list
-            ]
-            interpolatedList = self.imageList[self.start_INP0 - 1 : self.end_INP0]
-            interpolatedList = [
-                osp.splitext(img_p)[0] + ".json" for img_p in interpolatedList
-            ]
-            img_indices = np.linspace(
-                self.start_INP0 - 1,
-                self.end_INP0 - 1,
-                num=int((self.end_INP0 - self.start_INP0 + 1) / self.interval_INPO),
-                dtype=int,
-            )
-
-            ref_bxoxes = []
-            for jdx, json_path in enumerate(labelList):
-                with open(json_path) as file:
-                    data = json.load(file)
-
-                bboxes = [
-                    data["shapes"][i]["points"] for i in range(len(data["shapes"]))
-                ]
-                labels = [
-                    data["shapes"][i]["label"] for i in range(len(data["shapes"]))
-                ]
-                track_ids = [
-                    data["shapes"][i]["track_id"] for i in range(len(data["shapes"]))
-                ]
-                # need boxes in x,y,w,h
-                bboxes_xyxy = [convert(bboxes[i]) for i in range(len(bboxes))]
-                picked_item = np.intersect1d(
-                    np.argwhere(np.array(track_ids) == self.ID_INPO),
-                    np.argwhere(np.array(labels) == self.label_INPO),
-                )[0]
-                ref_bxoxes.append(bboxes_xyxy[picked_item])
-
-            xyxy_bboxes = np.array(ref_bxoxes).astype(int)
-            xywh_bboxes = cvt_xyxy2xywh(xyxy_bboxes)
-
-            interpolated_data = []
-            for jdx in range(4):
-                kernel = RationalQuadratic()
-                gpr = GaussianProcessRegressor(kernel=kernel, random_state=0).fit(
-                    img_indices.reshape(-1, 1), xywh_bboxes[:, jdx]
-                )
-                interpolated_data.append(
-                    gpr.predict(
-                        np.arange(self.start_INP0 - 1, self.end_INP0).reshape(-1, 1),
-                        return_std=False,
-                    )
-                )
-
-            interpolated_data = np.stack(interpolated_data, axis=1)
-            cvt_interpolated_data = cvt_xywh2xyxy(interpolated_data).astype(int)
-
-            lf = LabelFile()
-            # Edit frame Shape and save
-            for jdx, json_path in enumerate(interpolatedList):
-                if json_path in labelList:
-                    continue
-                if os.path.isfile(json_path):
-                    loaded_label = LabelFile(json_path)
-                    loaded_shape = loaded_label.shapes
-                    newshape = {
-                        "label": self.label_INPO,
-                        "points": [
-                            [
-                                int(cvt_interpolated_data[jdx][0]),
-                                int(cvt_interpolated_data[jdx][1]),
-                            ],
-                            [
-                                int(cvt_interpolated_data[jdx][2]),
-                                int(cvt_interpolated_data[jdx][3]),
-                            ],
-                        ],
-                        "shape_type": "rectangle",
-                        "flags": {},
-                        "description": "",
-                        "group_id": None,
-                        "track_id": self.ID_INPO,
-                        "mask": None,
-                    }
-                    loaded_shape.append(newshape)
-
-                    imagePath = osp.splitext(json_path)[0] + ".jpg"
-                    # import ipdb; ipdb.set_trace()
-                    lf.save(
-                        filename=json_path,
-                        shapes=loaded_shape,
-                        imagePath=imagePath,
-                        imageData=None,
-                        imageHeight=self.image.height(),
-                        imageWidth=self.image.width(),
-                        otherData={},
-                        flags={},
-                    )
-                else:
-                    loaded_shape = []
-                    newshape = {
-                        "label": self.label_INPO,
-                        "points": [
-                            [
-                                int(cvt_interpolated_data[jdx][0]),
-                                int(cvt_interpolated_data[jdx][1]),
-                            ],
-                            [
-                                int(cvt_interpolated_data[jdx][2]),
-                                int(cvt_interpolated_data[jdx][3]),
-                            ],
-                        ],
-                        "shape_type": "rectangle",
-                        "flags": {},
-                        "description": "",
-                        "group_id": None,
-                        "track_id": self.ID_INPO,
-                        "mask": None,
-                    }
-                    loaded_shape.append(newshape)
-                    imagePath = osp.splitext(json_path)[0] + ".jpg"
-                    lf.save(
-                        filename=json_path,
-                        shapes=loaded_shape,
-                        imagePath=imagePath,
-                        imageData=None,
-                        imageHeight=self.image.height(),
-                        imageWidth=self.image.width(),
-                        otherData={},
-                        flags={},
-                    )
-
-            filenames = self.scanAllImages(self.lastOpenDir)
-
-            for filename in filenames:
-                label_file = osp.splitext(filename)[0] + ".json"
-                label_index = self.imageList.index(filename)
-                item = self.fileListWidget.item(label_index)
-                if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
-                    label_file
-                ):
-                    item.setCheckState(Qt.Checked)
-
-            # repaint the current frame
-            self.mode = "NORMAL"
-            self.INTERPOLATION_filename = self.INTERPOLATION_list[0]
-            self.filename = self.INTERPOLATION_filename
-            # load the start file
-            getIndex = self.imageList.index(self.INTERPOLATION_filename) + 1
-            self.navigation_list.statusBar.showMessage(
-                f"Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}"
-            )
-            self.loadFile(self.filename)
-
-            self.informationMessage(
-                "Box Interpolation",
-                (
-                    f"Track {self.label_INPO}-{self.ID_INPO} from frame "
-                    f"{self.start_INP0} to {self.end_INP0} "
-                    "Interpolation is completed"
-                ),
-            )
-
-    def DELETION(self, item=None):
-        dialog = DeletionDialog(
+            current_frame=current_index + 1,
+            total_frames=len(self.imageList),
             parent=self,
         )
         if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return
-
-        if (
-            dialog.start_frame_cell.text() == ""
-            or dialog.end_frame_cell.text() == ""
-            or dialog.ID_cell.text() == ""
-            or dialog.label_cell.text() == ""
-        ):
+        if dialog.option_value not in {1, 2}:
+            return
+        start_index = 0 if dialog.option_value == 1 else current_index
+        end_index = dialog.end_frame.value()
+        if end_index <= start_index:
+            self.errorMessage("Track IDs", "End frame must include the start frame.")
             return
 
-        start_frame = int(dialog.start_frame_cell.text().replace(" ", ""))
-        end_frame = int(dialog.end_frame_cell.text().replace(" ", ""))
-        ID = dialog.ID_cell.text().replace(" ", "")
-        label = dialog.label_cell.text().strip()
-
-        if end_frame - start_frame <= 0:
+        frame_data = []
+        try:
+            for image_path in self.imageList[start_index:end_index]:
+                label_file = self._loadLabelForImage(image_path)
+                shapes = list(label_file.shapes) if label_file else []
+                rectangles = []
+                for shape_index, shape in enumerate(shapes):
+                    if shape.get("shape_type") != "rectangle":
+                        continue
+                    points = normalized_rectangle_points(shape.get("points", []))
+                    (x1, y1), (x2, y2) = points
+                    rectangles.append((shape_index, [x1, y1, x2, y2]))
+                frame_data.append((image_path, label_file, shapes, rectangles))
+        except (LabelFileError, ValueError) as exc:
+            self.errorMessage("Track IDs", str(exc))
+            return
+        if not frame_data[0][3]:
             self.errorMessage(
-                "Track Deletion",
-                "Start frame is higher than End frame.",
+                "Track IDs", "The first target frame has no valid rectangles."
             )
+            return
 
+        tracker = SORT_main(max_age=1, min_hits=1, iou_threshold=0.1)
+        KalmanBoxTracker.count = 0
+        if dialog.option_value == 2:
+            seed_ids = []
+            for shape_index, box in frame_data[0][3]:
+                value = shape_track_id(frame_data[0][2][shape_index])
+                try:
+                    tracker_id = int(value)
+                except (TypeError, ValueError):
+                    self.errorMessage(
+                        "Track IDs",
+                        "Every seed rectangle must have a numeric track ID.",
+                    )
+                    return
+                tracker.trackers.append(
+                    KalmanBoxTracker(np.asarray(box, dtype=float), id=tracker_id)
+                )
+                seed_ids.append(tracker_id)
+            KalmanBoxTracker.count = max(seed_ids, default=-1) + 1
+
+        requests = []
+        try:
+            for frame_number, (image_path, label_file, shapes, rectangles) in enumerate(
+                frame_data
+            ):
+                detections = np.asarray(
+                    [box + [1.0] for _, box in rectangles], dtype=float
+                )
+                if detections.size == 0:
+                    detections = np.empty((0, 5), dtype=float)
+                tracks = tracker.update(detections)
+                if not rectangles or tracks.size == 0:
+                    continue
+
+                rectangle_centers = np.asarray(
+                    [
+                        [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2]
+                        for _, box in rectangles
+                    ]
+                )
+                track_centers = np.column_stack(
+                    (
+                        (tracks[:, 0] + tracks[:, 2]) / 2,
+                        (tracks[:, 1] + tracks[:, 3]) / 2,
+                    )
+                )
+                costs = np.linalg.norm(
+                    rectangle_centers[:, None, :] - track_centers[None, :, :], axis=2
+                )
+                shape_rows, track_columns = linear_sum_assignment(costs)
+                changed = False
+                for shape_row, track_column in zip(shape_rows, track_columns):
+                    shape_index = rectangles[shape_row][0]
+                    new_id = str(int(tracks[track_column, 4]))
+                    if str(shape_track_id(shapes[shape_index])) != new_id:
+                        shapes[shape_index]["track_id"] = new_id
+                        shapes[shape_index]["group_id"] = int(new_id)
+                        changed = True
+                if changed:
+                    requests.append(
+                        self._labelSaveRequest(image_path, shapes, label_file)
+                    )
+        except (LabelFileError, ValueError, FloatingPointError) as exc:
+            self.errorMessage("Track IDs", str(exc))
+            return
+
+        if not requests:
+            self.informationMessage(
+                "Track IDs", "SORT completed, but no track IDs needed changing."
+            )
+            return
+        if not self._saveLabelBatch(requests, "Track IDs"):
+            return
+        self.loadFile(self.filename)
+        self.informationMessage("Track IDs", "SORT ID association is complete.")
+
+    def INTERPOLATION(self, item=None):
+        if not self.imageList or self.filename not in self.imageList:
+            self.errorMessage(
+                "Box Interpolation", "Open a frame sequence before interpolating."
+            )
+            return
+        if not self._ensureSavedForWorkflow("Box Interpolation"):
+            return
+        dialog = InterpolationDialog(
+            min_val=1, max_val=len(self.imageList), parent=self
+        )
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            options = dialog.options()
+            start_frame = options.start_frame
+            end_frame = options.end_frame
+            interval = options.interval
+            img_indices = interpolation_indices(
+                start_frame, end_frame, interval, len(self.imageList)
+            )
+        except ValueError as exc:
+            self.errorMessage("Box Interpolation", str(exc))
+            return
+        if start_frame == end_frame:
+            self.errorMessage(
+                "Box Interpolation", "Interpolation requires at least two frames."
+            )
+            return
+
+        self.start_INP0 = start_frame
+        self.end_INP0 = end_frame
+        self.interval_INPO = interval
+        self.ID_INPO = options.track_id
+        self.label_INPO = options.label
+
+        self.mode = "TRACK INTERPOLATION"
+        self.INTERPOLATION_indices = img_indices
+        self.INTERPOLATION_list = [self.imageList[index] for index in img_indices]
+        self.INTERPOLATION_filename = self.INTERPOLATION_list[0]
+        self.loadFile(self.INTERPOLATION_filename)
+
+    def OKAY(self, item=None):
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import RationalQuadratic
+
+        if self.mode != "TRACK INTERPOLATION":
+            return
+        if not self._ensureSavedForWorkflow("Box Interpolation"):
+            return
+
+        reference_boxes = []
+        try:
+            for image_path in self.INTERPOLATION_list:
+                label_file = self._loadLabelForImage(image_path)
+                if label_file is None:
+                    raise ValueError(
+                        "Reference frame has no annotation: {}".format(image_path)
+                    )
+                matches = [
+                    shape
+                    for shape in label_file.shapes
+                    if shape.get("label") == self.label_INPO
+                    and str(shape_track_id(shape)) == self.ID_INPO
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "Reference frame {} must contain exactly one {}-{} "
+                        "rectangle; found {}.".format(
+                            osp.basename(image_path),
+                            self.label_INPO,
+                            self.ID_INPO,
+                            len(matches),
+                        )
+                    )
+                if matches[0].get("shape_type") != "rectangle":
+                    raise ValueError(
+                        "Reference shape in {} is not a rectangle.".format(
+                            osp.basename(image_path)
+                        )
+                    )
+                points = normalized_rectangle_points(matches[0]["points"])
+                (x1, y1), (x2, y2) = points
+                reference_boxes.append([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1])
+        except (LabelFileError, ValueError) as exc:
+            self.errorMessage("Box Interpolation", str(exc))
+            return
+
+        reference_indices = np.asarray(self.INTERPOLATION_indices).reshape(-1, 1)
+        reference_boxes = np.asarray(reference_boxes, dtype=float)
+        target_indices = np.arange(self.start_INP0 - 1, self.end_INP0)
+        predictions = []
+        for coordinate in range(4):
+            model = GaussianProcessRegressor(
+                kernel=RationalQuadratic(), random_state=0
+            ).fit(reference_indices, reference_boxes[:, coordinate])
+            predictions.append(model.predict(target_indices.reshape(-1, 1)))
+        predictions = np.stack(predictions, axis=1)
+        if not np.isfinite(predictions).all():
+            self.errorMessage(
+                "Box Interpolation", "Interpolation produced non-finite coordinates."
+            )
+            return
+
+        requests = []
+        reference_set = set(self.INTERPOLATION_indices)
+        try:
+            for offset, image_index in enumerate(target_indices):
+                if image_index in reference_set:
+                    continue
+                image_path = self.imageList[image_index]
+                label_file = self._loadLabelForImage(image_path)
+                shapes = list(label_file.shapes) if label_file else []
+                reader = QtGui.QImageReader(image_path)
+                size = reader.size()
+                if not size.isValid():
+                    raise ValueError("Cannot read target image: {}".format(image_path))
+
+                center_x, center_y, width, height = predictions[offset]
+                x1, x2 = sorted((center_x - width / 2, center_x + width / 2))
+                y1, y2 = sorted((center_y - height / 2, center_y + height / 2))
+                x1 = min(max(0.0, x1), max(0.0, size.width() - 1.0))
+                y1 = min(max(0.0, y1), max(0.0, size.height() - 1.0))
+                x2 = min(max(0.0, x2), float(size.width()))
+                y2 = min(max(0.0, y2), float(size.height()))
+                if x2 <= x1 or y2 <= y1:
+                    raise ValueError(
+                        "Interpolation produced an empty box for frame {}.".format(
+                            image_index + 1
+                        )
+                    )
+
+                matching = [
+                    shape
+                    for shape in shapes
+                    if shape.get("label") == self.label_INPO
+                    and str(shape_track_id(shape)) == self.ID_INPO
+                ]
+                new_shape = dict(matching[0]) if matching else {}
+                new_shape.update(
+                    label=self.label_INPO,
+                    points=[[x1, y1], [x2, y2]],
+                    shape_type="rectangle",
+                    flags=new_shape.get("flags", {}),
+                    description=new_shape.get("description", ""),
+                    group_id=new_shape.get(
+                        "group_id",
+                        int(self.ID_INPO) if self.ID_INPO.isdigit() else self.ID_INPO,
+                    ),
+                    track_id=self.ID_INPO,
+                    mask=None,
+                )
+                shapes = [
+                    shape
+                    for shape in shapes
+                    if not (
+                        shape.get("label") == self.label_INPO
+                        and str(shape_track_id(shape)) == self.ID_INPO
+                    )
+                ]
+                shapes.append(new_shape)
+                requests.append(self._labelSaveRequest(image_path, shapes, label_file))
+        except (LabelFileError, ValueError) as exc:
+            self.errorMessage("Box Interpolation", str(exc))
+            return
+
+        if not self._saveLabelBatch(requests, "Box Interpolation"):
+            return
+        self.mode = "NORMAL"
+        start_filename = self.imageList[self.start_INP0 - 1]
+        get_index = self.imageList.index(start_filename) + 1
+        self.navigation_list.statusBar.showMessage(
+            f"Status: {get_index}/{len(self.imageList)} | Mode: {self.mode}"
+        )
+        self.loadFile(start_filename)
+        self.informationMessage(
+            "Box Interpolation",
+            (
+                f"Track {self.label_INPO}-{self.ID_INPO} from frame "
+                f"{self.start_INP0} to {self.end_INP0} interpolation is complete."
+            ),
+        )
+
+    def DELETION(self, item=None):
+        dialog = DeletionDialog(parent=self)
+        current_frame = (
+            self.imageList.index(self.filename) + 1
+            if self.filename in self.imageList
+            else 1
+        )
+        if hasattr(dialog, "setFrameRange"):
+            dialog.setFrameRange(1, len(self.imageList), current_frame)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        try:
+            start_frame = (
+                dialog.start_frame_cell.value()
+                if hasattr(dialog.start_frame_cell, "value")
+                else int(dialog.start_frame_cell.text().strip())
+            )
+            end_frame = (
+                dialog.end_frame_cell.value()
+                if hasattr(dialog.end_frame_cell, "value")
+                else int(dialog.end_frame_cell.text().strip())
+            )
+        except ValueError:
+            self.errorMessage(
+                "Track Modification", "Start and end frames must be whole numbers."
+            )
+            return
+        track_id = dialog.ID_cell.text().strip()
+        label = dialog.label_cell.text().strip()
+        if not track_id or not label:
+            self.errorMessage("Track Modification", "Object label and ID are required.")
+            return
+        if not 1 <= start_frame <= end_frame <= len(self.imageList):
+            self.errorMessage(
+                "Track Modification",
+                "Frames must satisfy 1 <= start <= end <= frame count.",
+            )
             return
 
         mode = dialog.mode
-        new_ID = dialog.new_ID_cell.text().replace(" ", "")
+        new_id = dialog.new_ID_cell.text().strip()
         new_label = dialog.new_label_cell.text().strip()
-        if mode == "Swap ID" and not new_ID:
+        if mode == "Swap ID" and not new_id:
             self.errorMessage(
-                "Track Modification",
-                "New ID is required when swapping IDs.",
+                "Track Modification", "New ID is required when swapping IDs."
             )
             return
         if mode == "Swap Label" and not new_label:
             self.errorMessage(
-                "Track Modification",
-                "New label is required when swapping labels.",
+                "Track Modification", "New label is required when swapping labels."
             )
             return
-        if mode == "Remove Box" and (new_ID or new_label):
+        if mode == "Remove Box" and (new_id or new_label):
             self.errorMessage(
                 "Track Modification",
                 "Remove Box deletes matching boxes. Choose Swap ID or Swap Label "
                 "to apply the new value.",
             )
             return
-
-        imageSlice = self.imageList[start_frame - 1 : end_frame]
-
-        def shape_track_id(shape):
-            track_id = shape.get("track_id")
-            if track_id is None or track_id == "":
-                track_id = shape.get("group_id")
-            return None if track_id is None else str(track_id)
-
-        def labels_match(shape):
-            return str(shape.get("label", "")) == label
-
-        def set_shape_track_id(shape, track_id):
-            shape["track_id"] = track_id
-            shape["group_id"] = int(track_id) if track_id.isdigit() else track_id
-
-        frame_paths = []
-        for img_path in imageSlice:
-            basename = osp.splitext(osp.basename(img_path))[0] + ".json"
-            json_path = osp.splitext(img_path)[0] + ".json"
-            if self.lastOpenDir:
-                alt = osp.join(self.lastOpenDir, basename)
-                if os.path.isfile(alt):
-                    json_path = alt
-            if not os.path.isfile(json_path):
-                continue
-
-            frame_paths.append((img_path, json_path))
-
-        source_exists = False
-        if mode == "Swap ID":
-            for _, json_path in frame_paths:
-                loaded_label = LabelFile(json_path)
-                source_exists = any(
-                    labels_match(shape) and shape_track_id(shape) == ID
-                    for shape in loaded_label.shapes
-                )
-                if source_exists:
-                    break
-            loaded_label = None
-        if mode == "Swap ID" and not source_exists:
-            self.errorMessage(
-                "Track Modification",
-                f"Track {label}-{ID} was not found in the selected frame range.",
-            )
+        if mode not in {"Remove Box", "Swap ID", "Swap Label"}:
+            self.errorMessage("Track Modification", "Unsupported modification mode.")
+            return
+        if not self._ensureSavedForWorkflow("Track Modification"):
             return
 
-        lf = LabelFile()
-        for img_path, json_path in frame_paths:
-            loaded_label = LabelFile(json_path)
-            loaded_shape = loaded_label.shapes
-            frame_source_exists = any(
-                labels_match(shape) and shape_track_id(shape) == ID
-                for shape in loaded_shape
+        def matches(shape, wanted_id=track_id):
+            return shape.get("label") == label and str(shape_track_id(shape)) == str(
+                wanted_id
             )
-            new_shape = []
-            for s in loaded_shape:
-                tid = shape_track_id(s)
-                matching_label = labels_match(s)
-                match = matching_label and tid == ID
-                if match and mode == "Remove Box":
+
+        def set_track_id(shape, value):
+            shape["track_id"] = value
+            shape["group_id"] = int(value) if value.isdigit() else value
+
+        requests = []
+        source_count = 0
+        try:
+            for image_path in self.imageList[start_frame - 1 : end_frame]:
+                label_file = self._loadLabelForImage(image_path)
+                if label_file is None:
                     continue
-                if match and mode == "Swap ID" and new_ID:
-                    set_shape_track_id(s, new_ID)
-                elif (
-                    mode == "Swap ID"
-                    and new_ID
-                    and frame_source_exists
-                    and matching_label
-                    and tid == new_ID
-                ):
-                    set_shape_track_id(s, ID)
-                if match and mode == "Swap Label" and new_label:
-                    s["label"] = new_label
-                new_shape.append(s)
+                shapes = label_file.shapes
+                frame_has_source = any(matches(shape) for shape in shapes)
+                source_count += sum(matches(shape) for shape in shapes)
+                updated_shapes = []
+                changed = False
+                for shape in shapes:
+                    shape = dict(shape)
+                    if matches(shape):
+                        changed = True
+                        if mode == "Remove Box":
+                            continue
+                        if mode == "Swap ID":
+                            set_track_id(shape, new_id)
+                        elif mode == "Swap Label":
+                            shape["label"] = new_label
+                    elif (
+                        mode == "Swap ID"
+                        and frame_has_source
+                        and shape.get("label") == label
+                        and str(shape_track_id(shape)) == new_id
+                    ):
+                        changed = True
+                        set_track_id(shape, track_id)
+                    updated_shapes.append(shape)
+                if changed:
+                    requests.append(
+                        self._labelSaveRequest(image_path, updated_shapes, label_file)
+                    )
+        except (LabelFileError, ValueError) as exc:
+            self.errorMessage("Track Modification", str(exc))
+            return
 
-            imagePath = loaded_label.imagePath or osp.basename(img_path)
-
-            lf.save(
-                filename=json_path,
-                shapes=new_shape,
-                imagePath=imagePath,
-                imageData=None,
-                imageHeight=self.image.height(),
-                imageWidth=self.image.width(),
-                flags={},
+        if source_count == 0:
+            self.informationMessage(
+                "Track Modification",
+                f"Track {label}-{track_id} was not found; no files were changed.",
             )
+            return
+        if not self._saveLabelBatch(requests, "Track Modification"):
+            return
 
-        self.filename = self.imageList[start_frame]
-        getIndex = self.imageList.index(self.filename) + 1
+        start_filename = self.imageList[start_frame - 1]
         self.navigation_list.statusBar.showMessage(
-            f"Status: {getIndex}/{len(self.imageList)} | Mode: {self.mode}"
+            f"Status: {start_frame}/{len(self.imageList)} | Mode: {self.mode}"
         )
-        self.loadFile(self.filename)
-
+        self.loadFile(start_filename)
         if mode == "Remove Box":
-            msg = (
-                f"Track {label}-{ID} from frame {start_frame} to {end_frame} is deleted"
+            message = (
+                f"Track {label}-{track_id} from frame {start_frame} to "
+                f"{end_frame} was deleted."
             )
         elif mode == "Swap ID":
-            msg = (
-                f"Track {label}-{ID} swapped to ID {new_ID} from frame "
-                f"{start_frame} to {end_frame}"
+            message = (
+                f"Track {label}-{track_id} swapped with ID {new_id} from frame "
+                f"{start_frame} to {end_frame}."
             )
-        elif mode == "Swap Label":
-            msg = (
-                f"Track {label}-{ID} swapped to label {new_label} from frame "
-                f"{start_frame} to {end_frame}"
+        else:
+            message = (
+                f"Track {label}-{track_id} changed to label {new_label} from frame "
+                f"{start_frame} to {end_frame}."
             )
-        self.informationMessage("Track Modification", msg)
+        self.informationMessage("Track Modification", message)
 
-    def _saveTrackResult(
+    def _trackResultRequest(
         self, img_path, label, track_id, group_id, new_points, img_shape
     ):
-        basename = osp.splitext(osp.basename(img_path))[0] + ".json"
-        json_path = osp.splitext(img_path)[0] + ".json"
-        if self.lastOpenDir:
-            alt = osp.join(self.lastOpenDir, basename)
-            if os.path.isfile(alt):
-                json_path = alt
-
-        if os.path.isfile(json_path):
-            loaded = LabelFile(json_path)
-            shapes = loaded.shapes
-            img_rel = loaded.imagePath
-        else:
-            shapes = []
-            img_rel = osp.basename(img_path)
+        loaded = self._loadLabelForImage(img_path)
+        shapes = list(loaded.shapes) if loaded else []
 
         updated = False
         tid_str = str(track_id) if track_id is not None else None
         for s in shapes:
-            s_tid = str(s.get("track_id") or s.get("group_id"))
+            s_tid_value = shape_track_id(s)
+            s_tid = str(s_tid_value) if s_tid_value is not None else None
             if s["label"] == label and s_tid == tid_str:
                 s["points"] = new_points
                 updated = True
@@ -2125,15 +2112,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
 
-        LabelFile().save(
-            filename=json_path,
-            shapes=shapes,
-            imagePath=img_rel,
-            imageData=None,
-            imageHeight=img_shape[0],
-            imageWidth=img_shape[1],
-            flags={},
+        request = self._labelSaveRequest(img_path, shapes, loaded)
+        request["imageHeight"] = img_shape[0]
+        request["imageWidth"] = img_shape[1]
+        return request
+
+    def _saveTrackResult(
+        self, img_path, label, track_id, group_id, new_points, img_shape
+    ):
+        request = self._trackResultRequest(
+            img_path, label, track_id, group_id, new_points, img_shape
         )
+        return self._saveLabelBatch([request], "Object Tracking")
 
     def _getSelectedRect(self, title):
         if len(self.canvas.selectedShapes) != 1:
@@ -2143,9 +2133,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if shape.shape_type != "rectangle" or len(shape.points) != 2:
             self.errorMessage(title, "Only rectangle bounding boxes can be tracked.")
             return None
+        try:
+            normalized_rectangle_points(
+                [[point.x(), point.y()] for point in shape.points]
+            )
+        except ValueError as exc:
+            self.errorMessage(title, str(exc))
+            return None
         return shape
 
     def _getTrackEndFrame(self, title, curr_index, total_frames):
+        if curr_index + 1 >= total_frames:
+            self.errorMessage(title, "The current frame is already the final frame.")
+            return None
         end_frame, ok = QtWidgets.QInputDialog.getInt(
             self,
             title,
@@ -2158,7 +2158,316 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return end_frame
 
+    @staticmethod
+    def _runCsrtTracking(
+        image_paths,
+        curr_index,
+        end_frame,
+        initial_bbox,
+        cancel_event,
+        report_progress,
+    ):
+        x, y, width, height = initial_bbox
+        if width <= 0 or height <= 0:
+            raise ValueError("The selected rectangle is too small to track.")
+        report_progress(curr_index + 1, "Initializing CSRT tracker...")
+        current_frame = cv2.imread(image_paths[curr_index])
+        if current_frame is None:
+            raise ValueError("Cannot read current frame image.")
+        try:
+            tracker = cv2.TrackerCSRT.create()
+            initialized = tracker.init(current_frame, initial_bbox)
+        except (AttributeError, cv2.error) as exc:
+            raise RuntimeError("Cannot initialize CSRT: {}".format(exc)) from exc
+        if initialized is False:
+            raise RuntimeError("CSRT rejected the selected box.")
+
+        frames = []
+        last_tracked = curr_index
+        stop_reason = "selected end frame reached"
+        for index in range(curr_index + 1, end_frame):
+            if cancel_event.is_set():
+                stop_reason = "canceled"
+                break
+            report_progress(index + 1, "Tracking frame {}...".format(index + 1))
+            frame = cv2.imread(image_paths[index])
+            if frame is None:
+                stop_reason = "frame {} could not be read".format(index + 1)
+                break
+            try:
+                success, bbox = tracker.update(frame)
+            except cv2.error as exc:
+                stop_reason = "tracker error on frame {}: {}".format(index + 1, exc)
+                break
+            if not success:
+                stop_reason = "tracking failed on frame {}".format(index + 1)
+                break
+            box_x, box_y, box_width, box_height = [int(value) for value in bbox]
+            box_x = min(max(0, box_x), max(0, frame.shape[1] - 1))
+            box_y = min(max(0, box_y), max(0, frame.shape[0] - 1))
+            right = min(frame.shape[1], box_x + box_width)
+            bottom = min(frame.shape[0], box_y + box_height)
+            if right <= box_x or bottom <= box_y:
+                stop_reason = "tracker returned an empty box on frame {}".format(
+                    index + 1
+                )
+                break
+            frames.append(
+                {
+                    "image_path": image_paths[index],
+                    "points": [[box_x, box_y], [right, bottom]],
+                    "image_shape": frame.shape,
+                }
+            )
+            last_tracked = index
+        return {
+            "frames": frames,
+            "last_index": last_tracked,
+            "stop_reason": stop_reason,
+        }
+
+    @staticmethod
+    def _runBoTSORTTracking(
+        image_paths,
+        curr_index,
+        end_frame,
+        initial_box,
+        use_refine,
+        cancel_event,
+        report_progress,
+    ):
+        from labelme.track_algo import BoTSORTForwardTracker
+
+        tracker = None
+        ai_model = None
+        try:
+            report_progress(curr_index + 1, "Loading YOLO + BoTSORT...")
+            current_frame = cv2.imread(image_paths[curr_index])
+            if current_frame is None:
+                raise ValueError("Cannot read current frame image.")
+            tracker = BoTSORTForwardTracker()
+            if cancel_event.is_set():
+                return {
+                    "frames": [],
+                    "last_index": curr_index,
+                    "stop_reason": "canceled",
+                }
+            if not tracker.init(current_frame, initial_box):
+                raise ValueError(
+                    "No YOLO detection matched the selected box (IOU < 0.3). "
+                    "Ensure the object is clearly visible."
+                )
+
+            if use_refine:
+                report_progress(curr_index + 1, "Loading EfficientSAM...")
+                model_definition = next(
+                    model for model in MODELS if model.name == "EfficientSam (speed)"
+                )
+                ai_model = model_definition()
+
+            frames = []
+            last_tracked = curr_index
+            stop_reason = "selected end frame reached"
+            for index in range(curr_index + 1, end_frame):
+                if cancel_event.is_set():
+                    stop_reason = "canceled"
+                    break
+                report_progress(
+                    index + 1, "Tracking frame {} with BoTSORT...".format(index + 1)
+                )
+                frame = cv2.imread(image_paths[index])
+                if frame is None:
+                    stop_reason = "frame {} could not be read".format(index + 1)
+                    break
+                success, xyxy = tracker.update(frame)
+                if not success:
+                    stop_reason = "tracking failed on frame {}".format(index + 1)
+                    break
+                box_x1, box_y1, box_x2, box_y2 = (
+                    int(xyxy[0]),
+                    int(xyxy[1]),
+                    int(xyxy[2]),
+                    int(xyxy[3]),
+                )
+
+                if ai_model is not None and not cancel_event.is_set():
+                    ai_model.set_image(frame[:, :, ::-1])
+                    mask = ai_model.predict_mask_from_box(
+                        [box_x1, box_y1, box_x2, box_y2]
+                    )
+                    mask = None if mask is None else np.asarray(mask, dtype=bool)
+                    if mask is not None and mask.ndim == 2 and mask.any():
+                        ys, xs = np.where(mask)
+                        box_x1, box_y1, box_x2, box_y2 = (
+                            int(xs.min()),
+                            int(ys.min()),
+                            int(xs.max() + 1),
+                            int(ys.max() + 1),
+                        )
+
+                if cancel_event.is_set():
+                    stop_reason = "canceled"
+                    break
+                box_x1 = min(max(0, box_x1), max(0, frame.shape[1] - 1))
+                box_y1 = min(max(0, box_y1), max(0, frame.shape[0] - 1))
+                box_x2 = min(max(0, box_x2), frame.shape[1])
+                box_y2 = min(max(0, box_y2), frame.shape[0])
+                if box_x2 <= box_x1 or box_y2 <= box_y1:
+                    stop_reason = "tracker returned an empty box on frame {}".format(
+                        index + 1
+                    )
+                    break
+                frames.append(
+                    {
+                        "image_path": image_paths[index],
+                        "points": [[box_x1, box_y1], [box_x2, box_y2]],
+                        "image_shape": frame.shape,
+                    }
+                )
+                last_tracked = index
+            return {
+                "frames": frames,
+                "last_index": last_tracked,
+                "stop_reason": stop_reason,
+            }
+        finally:
+            if tracker is not None:
+                tracker.reset()
+            if ai_model is not None:
+                close = getattr(ai_model, "close", None)
+                if close is not None:
+                    close()
+
+    def _startTrackingWorker(
+        self, title, function, minimum, maximum, context, initial_message
+    ):
+        if self._tracking_thread is not None and self._tracking_thread.isRunning():
+            self.errorMessage(title, "Another tracking operation is already running.")
+            return False
+        progress = QtWidgets.QProgressDialog(
+            initial_message, "Cancel", minimum, maximum, self
+        )
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(minimum)
+
+        worker = CancellableTrackingWorker(function)
+        thread = QtCore.QThread(self)
+        worker.moveToThread(thread)
+        self._tracking_worker = worker
+        self._tracking_thread = thread
+        self._tracking_progress = progress
+        self._tracking_context = context
+        self._tracking_request_active = True
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._trackingProgressUpdated)
+        worker.finished.connect(self._trackingWorkerFinished)
+        worker.failed.connect(self._trackingWorkerFailed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        progress.canceled.connect(self._cancelTrackingWorker)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._trackingWorkerCleanedUp)
+        progress.show()
+        thread.start()
+        return True
+
+    @QtCore.Slot()
+    def _cancelTrackingWorker(self):
+        if self._tracking_worker is not None:
+            self._tracking_worker.cancel()
+        if self._tracking_progress is not None:
+            self._tracking_progress.setLabelText("Canceling tracking...")
+
+    @QtCore.Slot(int, str)
+    def _trackingProgressUpdated(self, value, message):
+        if self._tracking_progress is not None:
+            self._tracking_progress.setLabelText(message)
+            self._tracking_progress.setValue(value)
+
+    @QtCore.Slot(object)
+    def _trackingWorkerFinished(self, result):
+        self._tracking_request_active = False
+        context = self._tracking_context or {}
+        if self._close_after_tracking:
+            return
+        title = context.get("title", "Object Tracking")
+        stop_reason = result.get("stop_reason", "completed")
+        if stop_reason == "canceled":
+            self.informationMessage(title, "Tracking was canceled; no files changed.")
+            return
+
+        try:
+            requests = [
+                self._trackResultRequest(
+                    frame["image_path"],
+                    context["label"],
+                    context["track_id"],
+                    context["group_id"],
+                    frame["points"],
+                    frame["image_shape"],
+                )
+                for frame in result.get("frames", [])
+            ]
+        except (LabelFileError, ValueError) as exc:
+            self.errorMessage(title, str(exc))
+            return
+        if requests and not self._saveLabelBatch(requests, title):
+            return
+
+        source_filename = context.get("source_filename")
+        if source_filename == self.filename:
+            self.loadFile(source_filename)
+        tracked_count = len(requests)
+        last_index = result.get("last_index", context.get("start_index", 0))
+        self.informationMessage(
+            title,
+            "Tracked {}-{} forward {} frames (frame {} to {}); {}.".format(
+                context.get("label"),
+                context.get("track_id"),
+                tracked_count,
+                context.get("start_index", 0) + 1,
+                last_index + 1,
+                stop_reason,
+            ),
+        )
+
+    @QtCore.Slot(object)
+    def _trackingWorkerFailed(self, error):
+        self._tracking_request_active = False
+        if self._close_after_tracking:
+            return
+        context = self._tracking_context or {}
+        title = context.get("title", "Object Tracking")
+        help_text = context.get("failure_help", "")
+        message = str(error)
+        if help_text:
+            message = "{}\n{}".format(message, help_text)
+        self.errorMessage(title, message)
+
+    @QtCore.Slot()
+    def _trackingWorkerCleanedUp(self):
+        thread = self.sender()
+        if self._tracking_thread is thread:
+            if self._tracking_progress is not None:
+                self._tracking_progress.close()
+            self._tracking_thread = None
+            self._tracking_worker = None
+            self._tracking_progress = None
+            self._tracking_context = None
+        if self._close_after_tracking and not self._tracking_request_active:
+            QtCore.QTimer.singleShot(0, self.close)
+
     def trackForward(self):
+        if not self.imageList or self.filename not in self.imageList:
+            self.errorMessage("Track Forward", "Open a frame sequence before tracking.")
+            return
+        if not self._ensureSavedForWorkflow("Track Forward"):
+            return
         shape = self._getSelectedRect("Track Forward")
         if shape is None:
             return
@@ -2179,57 +2488,50 @@ class MainWindow(QtWidgets.QMainWindow):
         w = int(abs(p2.x() - p1.x()))
         h = int(abs(p2.y() - p1.y()))
 
-        curr_img = cv2.imread(self.imageList[curr_index])
-        if curr_img is None:
-            self.errorMessage("Track Forward", "Cannot read current frame image.")
-            return
-
-        tracker = cv2.TrackerCSRT.create()
-        tracker.init(curr_img, (x, y, w, h))
-
-        last_tracked = curr_index
-        for i in range(curr_index + 1, end_frame):
-            frame = cv2.imread(self.imageList[i])
-            if frame is None:
-                break
-            success, bbox = tracker.update(frame)
-            if not success:
-                break
-            bx, by, bw, bh = [int(v) for v in bbox]
-            self._saveTrackResult(
-                self.imageList[i],
-                label,
-                track_id,
-                group_id,
-                [[bx, by], [bx + bw, by + bh]],
-                curr_img.shape,
-            )
-            last_tracked = i
-
-        tracked_count = last_tracked - curr_index
-        self.loadFile(self.filename)
-        self.informationMessage(
+        function = functools.partial(
+            self._runCsrtTracking,
+            tuple(self.imageList),
+            curr_index,
+            end_frame,
+            (x, y, w, h),
+        )
+        self._startTrackingWorker(
             "Track Forward",
-            f"Tracked {label}-{track_id} forward {tracked_count} frames "
-            f"(frame {curr_index + 1} to {last_tracked + 1}).",
+            function,
+            curr_index + 1,
+            end_frame,
+            {
+                "title": "Track Forward",
+                "label": label,
+                "track_id": track_id,
+                "group_id": group_id,
+                "source_filename": self.filename,
+                "start_index": curr_index,
+            },
+            "Initializing CSRT tracker...",
         )
 
     def trackForwardBoTSORT(self):
+        if not self.imageList or self.filename not in self.imageList:
+            self.errorMessage(
+                "Track Forward (BoTSORT)",
+                "Open a frame sequence before tracking.",
+            )
+            return
+        if not self._ensureSavedForWorkflow("Track Forward (BoTSORT)"):
+            return
         shape = self._getSelectedRect("Track Forward (BoTSORT)")
         if shape is None:
             return
 
-        try:
-            from labelme.track_algo import BoTSORTForwardTracker
-        except ImportError:
-            self.errorMessage(
-                "Track Forward (BoTSORT)",
-                "ultralytics is not installed.\nRun: pip install ultralytics",
-            )
-            return
-
         curr_index = self.imageList.index(self.filename)
         total_frames = len(self.imageList)
+        if curr_index + 1 >= total_frames:
+            self.errorMessage(
+                "Track Forward (BoTSORT)",
+                "The current frame is already the final frame.",
+            )
+            return
 
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Track Forward (BoTSORT)")
@@ -2261,101 +2563,32 @@ class MainWindow(QtWidgets.QMainWindow):
         x2 = int(max(p1.x(), p2.x()))
         y2 = int(max(p1.y(), p2.y()))
 
-        curr_img = cv2.imread(self.imageList[curr_index])
-        if curr_img is None:
-            self.errorMessage(
-                "Track Forward (BoTSORT)", "Cannot read current frame image."
-            )
-            return
-
-        progress = QtWidgets.QProgressDialog(
-            "Loading YOLO model...", "Cancel", curr_index, end_frame, self
+        function = functools.partial(
+            self._runBoTSORTTracking,
+            tuple(self.imageList),
+            curr_index,
+            end_frame,
+            [x1, y1, x2, y2],
+            use_refine,
         )
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setValue(curr_index)
-        QtWidgets.QApplication.processEvents()
-
-        tracker = None
-        ai_model = None
-        last_tracked = curr_index
-        try:
-            tracker = BoTSORTForwardTracker(model_name="yolo26x.pt")
-
-            if use_refine:
-                progress.setLabelText("Loading EfficientSAM...")
-                QtWidgets.QApplication.processEvents()
-                self.canvas.initializeAiModel("EfficientSam (speed)")
-                ai_model = self.canvas._ai_model
-
-            progress.setLabelText("Running YOLO + BoTSORT tracking...")
-
-            if not tracker.init(curr_img, [x1, y1, x2, y2]):
-                self.errorMessage(
-                    "Track Forward (BoTSORT)",
-                    "No YOLO detection matched the selected box (IOU < 0.3).\n"
-                    "Ensure the object is clearly visible.",
-                )
-                return
-
-            for i in range(curr_index + 1, end_frame):
-                if progress.wasCanceled():
-                    break
-                progress.setValue(i)
-                QtWidgets.QApplication.processEvents()
-
-                frame = cv2.imread(self.imageList[i])
-                if frame is None:
-                    break
-                success, xyxy = tracker.update(frame)
-                if not success:
-                    break
-
-                bx1, by1, bx2, by2 = (
-                    int(xyxy[0]),
-                    int(xyxy[1]),
-                    int(xyxy[2]),
-                    int(xyxy[3]),
-                )
-
-                if ai_model is not None and not progress.wasCanceled():
-                    rgb_frame = frame[:, :, ::-1]
-                    ai_model.set_image(rgb_frame)
-                    QtWidgets.QApplication.processEvents()
-                    if not progress.wasCanceled():
-                        mask = ai_model.predict_mask_from_box([bx1, by1, bx2, by2])
-                        if mask is not None and mask.any():
-                            ys, xs = np.where(mask)
-                            bx1, by1, bx2, by2 = (
-                                int(xs.min()),
-                                int(ys.min()),
-                                int(xs.max()),
-                                int(ys.max()),
-                            )
-
-                if progress.wasCanceled():
-                    break
-
-                self._saveTrackResult(
-                    self.imageList[i],
-                    label,
-                    track_id,
-                    group_id,
-                    [[bx1, by1], [bx2, by2]],
-                    curr_img.shape,
-                )
-                last_tracked = i
-        finally:
-            progress.close()
-            if tracker is not None:
-                tracker.reset()
-            if ai_model is not None:
-                self.canvas.releaseAiModel()
-        tracked_count = last_tracked - curr_index
-        self.loadFile(self.filename)
-        self.informationMessage(
+        self._startTrackingWorker(
             "Track Forward (BoTSORT)",
-            f"Tracked {label}-{track_id} forward {tracked_count} frames "
-            f"(frame {curr_index + 1} to {last_tracked + 1}).",
+            function,
+            curr_index + 1,
+            end_frame,
+            {
+                "title": "Track Forward (BoTSORT)",
+                "label": label,
+                "track_id": track_id,
+                "group_id": group_id,
+                "source_filename": self.filename,
+                "start_index": curr_index,
+                "failure_help": (
+                    "Install the optional ultralytics dependencies and configure "
+                    "a valid YOLO model."
+                ),
+            },
+            "Loading YOLO + BoTSORT...",
         )
 
     def refineBboxAI(self):
@@ -2373,23 +2606,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.canvas.initializeAiModel("EfficientSam (speed)")
         ai_model = self.canvas._ai_model
-
-        for shape in shapes:
-            p1, p2 = shape.points[0], shape.points[1]
-            box = [
-                min(p1.x(), p2.x()),
-                min(p1.y(), p2.y()),
-                max(p1.x(), p2.x()),
-                max(p1.y(), p2.y()),
-            ]
-            mask = ai_model.predict_mask_from_box(box)
-            if mask is None or not mask.any():
-                continue
-            ys, xs = np.where(mask)
-            shape.points[0] = QtCore.QPointF(float(xs.min()), float(ys.min()))
-            shape.points[1] = QtCore.QPointF(float(xs.max()), float(ys.max()))
-
-        self.canvas.releaseAiModel()
+        refined = 0
+        try:
+            for shape in shapes:
+                p1, p2 = shape.points[0], shape.points[1]
+                box = [
+                    min(p1.x(), p2.x()),
+                    min(p1.y(), p2.y()),
+                    max(p1.x(), p2.x()),
+                    max(p1.y(), p2.y()),
+                ]
+                mask = ai_model.predict_mask_from_box(box)
+                if mask is None or not np.asarray(mask).any():
+                    continue
+                ys, xs = np.where(mask)
+                shape.points[0] = QtCore.QPointF(float(xs.min()), float(ys.min()))
+                shape.points[1] = QtCore.QPointF(
+                    float(xs.max() + 1), float(ys.max() + 1)
+                )
+                refined += 1
+        finally:
+            self.canvas.releaseAiModel()
+        if not refined:
+            self.status("The AI model returned no usable masks.", delay=8000)
+            return
         self.canvas.update()
         self.setDirty()
 
@@ -2461,6 +2701,15 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         self._hosted_sam2_image_cache[frame_key] = response
+        while len(self._hosted_sam2_image_cache) > self._hosted_sam2_max_cached_frames:
+            oldest_key = next(iter(self._hosted_sam2_image_cache))
+            self._hosted_sam2_image_cache.pop(oldest_key, None)
+        retry_point = context.get("retry_point")
+        if retry_point is not None:
+            self._sendHostedSam2PointPrompt(
+                frame_key, retry_point[0], retry_point[1], retry_count=1
+            )
+            return
         self._armHostedSam2PointPrompt()
 
     def _hostedSam2PointPrompt(self, point):
@@ -2473,15 +2722,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status("Hosted SAM2 request already in progress.")
             return
 
+        self._sendHostedSam2PointPrompt(frame_key, point.x(), point.y())
+
+    def _sendHostedSam2PointPrompt(self, frame_key, x, y, retry_count=0):
+        image_info = self._hosted_sam2_image_cache.get(frame_key)
+        if image_info is None:
+            self.errorMessage("Hosted SAM2", "Current frame is not registered.")
+            return
         self.status("Sending SAM2 point prompt...")
         self._runHostedSam2Request(
             self._hosted_sam2_client.point_prompt,
             self._hostedSam2PointPromptFinished,
             image_info["image_id"],
-            point.x(),
-            point.y(),
+            x,
+            y,
             1,
-            _context={"frame_key": frame_key},
+            _context={
+                "kind": "point_prompt",
+                "frame_key": frame_key,
+                "point": (float(x), float(y)),
+                "retry_count": retry_count,
+            },
         )
 
     def _hostedSam2PointPromptCancelled(self):
@@ -2497,8 +2758,8 @@ class MainWindow(QtWidgets.QMainWindow):
         height = self.image.height()
         x1 = min(max(float(bbox[0]), 0.0), float(width - 1))
         y1 = min(max(float(bbox[1]), 0.0), float(height - 1))
-        x2 = min(max(float(bbox[2]), 0.0), float(width - 1))
-        y2 = min(max(float(bbox[3]), 0.0), float(height - 1))
+        x2 = min(max(float(bbox[2]), 0.0), float(width))
+        y2 = min(max(float(bbox[3]), 0.0), float(height))
         if x2 <= x1 or y2 <= y1:
             self.errorMessage("Hosted SAM2", "Hosted SAM2 returned an empty bbox.")
             return
@@ -2517,6 +2778,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.storeShapes()
         self.canvas.update()
         self._finishNewShape(shape, group_id, text_id, description)
+        if not self._hosted_sam2_cache_frames:
+            self._hosted_sam2_image_cache.pop(context["frame_key"], None)
         self.status("SAM2 bbox added.")
 
     def _runHostedSam2Request(self, function, on_success, *args, **kwargs):
@@ -2527,42 +2790,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hosted_sam2_worker = worker
         self._hosted_sam2_thread = thread
         self._hosted_sam2_request_active = True
+        self._hosted_sam2_request_context = context
+        self._hosted_sam2_on_success = on_success
 
         thread.started.connect(worker.run)
-        worker.finished.connect(
-            lambda result: self._hostedSam2RequestSucceeded(
-                on_success, result, context
-            )
-        )
+        worker.finished.connect(self._hostedSam2WorkerFinished)
         worker.failed.connect(self._hostedSam2RequestFailed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(
-            lambda thread=thread, worker=worker: self._hostedSam2RequestCleanedUp(
-                thread, worker
-            )
-        )
+        thread.finished.connect(self._hostedSam2RequestCleanedUp)
         thread.start()
 
-    def _hostedSam2RequestSucceeded(self, on_success, result, context):
+    @QtCore.Slot(object)
+    def _hostedSam2WorkerFinished(self, result):
+        on_success = self._hosted_sam2_on_success
+        context = self._hosted_sam2_request_context or {}
         self._hosted_sam2_request_active = False
+        if self._close_after_hosted_request:
+            return
         try:
             on_success(result, context)
         except Exception as exc:
             logger.exception("Hosted SAM2 response handling failed")
             self.errorMessage("Hosted SAM2", str(exc))
 
-    def _hostedSam2RequestFailed(self, message):
+    @QtCore.Slot(object)
+    def _hostedSam2RequestFailed(self, error):
         self._hosted_sam2_request_active = False
-        self.errorMessage("Hosted SAM2", message)
+        context = self._hosted_sam2_request_context or {}
+        if self._close_after_hosted_request:
+            return
+        if (
+            isinstance(error, HostedSam2Error)
+            and error.status_code == 404
+            and context.get("kind") == "point_prompt"
+            and context.get("retry_count", 0) == 0
+        ):
+            frame_key = context["frame_key"]
+            self._hosted_sam2_image_cache.pop(frame_key, None)
+            self.status("SAM2 cache expired; registering the frame again...")
+            self._runHostedSam2Request(
+                self._hosted_sam2_client.register_image,
+                self._hostedSam2ImageRegistered,
+                self.imageData,
+                client_frame_key=frame_key,
+                _context={
+                    "frame_key": frame_key,
+                    "retry_point": context["point"],
+                },
+            )
+            return
+        self.errorMessage("Hosted SAM2", str(error))
 
-    def _hostedSam2RequestCleanedUp(self, thread, worker):
+    @QtCore.Slot()
+    def _hostedSam2RequestCleanedUp(self):
+        thread = self.sender()
         if self._hosted_sam2_thread is thread:
             self._hosted_sam2_thread = None
-        if self._hosted_sam2_worker is worker:
             self._hosted_sam2_worker = None
+            self._hosted_sam2_request_context = None
+            self._hosted_sam2_on_success = None
+        if self._close_after_hosted_request and not self._hosted_sam2_request_active:
+            QtCore.QTimer.singleShot(0, self.close)
 
     def editID(self, item=None):
         if item and not isinstance(item, IDListWidgetItem):
@@ -2580,7 +2871,7 @@ class MainWindow(QtWidgets.QMainWindow):
         id = self.IDDialog.popUp(text=shape.track_id)
         if id is None:
             return
-        if not self.validateLabel(id):
+        if not str(id).strip():
             self.errorMessage(
                 self.tr("Invalid ID"),
                 self.tr("Invalid ID '{}' with validation type '{}'").format(
@@ -2594,12 +2885,6 @@ class MainWindow(QtWidgets.QMainWindow):
         item.setText(shape.track_id)
         self._update_shape_color(shape)
         self.setDirty()
-        unique_name = shape.label + "_" + str(shape.track_id)
-        if self.uniqLabelList.findItemByLabel(unique_name) is None:
-            item = self.uniqLabelList.createItemFromLabel(unique_name)
-            self.uniqLabelList.addItem(item)
-            rgb = self._get_rgb_by_label(unique_name)
-            self.uniqLabelList.setItemLabel(item, unique_name, rgb)
 
     def editLabel(self, item=None):
         if item and not isinstance(item, LabelListWidgetItem):
@@ -2613,6 +2898,7 @@ class MainWindow(QtWidgets.QMainWindow):
         shape = item.shape()
         if shape is None:
             return
+        previous_group_id = shape.group_id
         text, flags, group_id, description = self.labelDialog.popUp(
             text=shape.label,
             flags=shape.flags,
@@ -2632,8 +2918,8 @@ class MainWindow(QtWidgets.QMainWindow):
         shape.label = text
         shape.flags = flags
         shape.group_id = group_id
-        if group_id is not None:
-            shape.track_id = str(group_id)
+        if group_id != previous_group_id:
+            shape.track_id = group_id
         shape.description = description
 
         self._update_shape_color(shape)
@@ -2651,19 +2937,27 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             pass
         self.setDirty()
-        unique_name = shape.label + "_" + str(shape.track_id)
-        if self.uniqLabelList.findItemByLabel(unique_name) is None:
-            item = self.uniqLabelList.createItemFromLabel(unique_name)
-            self.uniqLabelList.addItem(item)
-            rgb = self._get_rgb_by_label(unique_name)
-            self.uniqLabelList.setItemLabel(item, unique_name, rgb)
+        self._ensureLabelSelector(shape.label)
 
     def fileSearchChanged(self):
-        self.importDirImages(
-            self.lastOpenDir,
-            pattern=self.fileSearch.text(),
-            load=False,
-        )
+        pattern = self.fileSearch.text()
+        try:
+            matcher = re.compile(pattern, re.IGNORECASE) if pattern else None
+        except re.error:
+            matcher = re.compile(re.escape(pattern), re.IGNORECASE)
+        for index in range(self.fileListWidget.count()):
+            item = self.fileListWidget.item(index)
+            item.setHidden(bool(matcher and not matcher.search(item.text())))
+
+    def _restoreCurrentFileSelection(self):
+        self.fileListWidget.blockSignals(True)
+        try:
+            if self.filename in self.imageList:
+                self.fileListWidget.setCurrentRow(self.imageList.index(self.filename))
+            else:
+                self.fileListWidget.clearSelection()
+        finally:
+            self.fileListWidget.blockSignals(False)
 
     def fileSelectionChanged(self):
         items = self.fileListWidget.selectedItems()
@@ -2672,6 +2966,7 @@ class MainWindow(QtWidgets.QMainWindow):
         item = items[0]
 
         if not self.mayContinue():
+            self._restoreCurrentFileSelection()
             return
 
         if self.mode == "None":
@@ -2693,7 +2988,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                 )
 
-                self.loadFile(filename)
+                if not self.loadFile(filename):
+                    self._restoreCurrentFileSelection()
+                    return
             else:
                 self.errorMessage(
                     "Box Interpolation",
@@ -2702,6 +2999,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "and Next (D) buttons to move between the selected frames"
                     ),
                 )
+                self._restoreCurrentFileSelection()
                 return
 
         else:
@@ -2709,7 +3007,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if currIndex < len(self.imageList):
                 filename = self.imageList[currIndex]
                 if filename:
-                    self.loadFile(filename)
+                    if not self.loadFile(filename):
+                        self._restoreCurrentFileSelection()
+                        return
 
             getIndex = self.imageList.index(self.filename) + 1
             self.navigation_list.statusBar.showMessage(
@@ -2752,12 +3052,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.labelList.addItem(label_list_item)
         id_list_item = IDListWidgetItem(str(shape.track_id), shape)
         self.IDList.addItem(id_list_item)
-        unique_name = shape.label + "_" + str(shape.track_id)
-        if self.uniqLabelList.findItemByLabel(unique_name) is None:
-            item = self.uniqLabelList.createItemFromLabel(unique_name)
-            self.uniqLabelList.addItem(item)
-            rgb = self._get_rgb_by_label(unique_name)
-            self.uniqLabelList.setItemLabel(item, unique_name, rgb)
+        self._ensureLabelSelector(shape.label)
         self.labelDialog.addLabelHistory(shape.label)
         self.IDDialog.addIDHistory(str(shape.track_id))
         for action in self.actions.onShapesPresent:
@@ -2771,7 +3066,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_shape_color(self, shape):
         unique_name = shape.label + "_" + str(shape.track_id)
-        r, g, b = self._get_rgb_by_label(unique_name)
+        r, g, b = self._get_rgb_by_label(unique_name, add_to_selector=False)
         shape.line_color = QtGui.QColor(r, g, b)
         shape.vertex_fill_color = QtGui.QColor(r, g, b)
         shape.hvertex_fill_color = QtGui.QColor(255, 255, 255)
@@ -2779,8 +3074,20 @@ class MainWindow(QtWidgets.QMainWindow):
         shape.select_line_color = QtGui.QColor(255, 255, 255)
         shape.select_fill_color = QtGui.QColor(r, g, b, 155)
 
-    def _get_rgb_by_label(self, label):
+    def _ensureLabelSelector(self, label):
+        if self.uniqLabelList.findItemByLabel(label) is None:
+            item = self.uniqLabelList.createItemFromLabel(label)
+            self.uniqLabelList.addItem(item)
+            rgb = self._get_rgb_by_label(label)
+            self.uniqLabelList.setItemLabel(item, label, rgb)
+
+    def _get_rgb_by_label(self, label, add_to_selector=True):
         if self._config["shape_color"] == "auto":
+            if not add_to_selector:
+                digest = hashlib.sha256(label.encode("utf-8")).digest()
+                label_id = int.from_bytes(digest[:4], "big")
+                label_id += self._config["shift_auto_shape_color"]
+                return LABEL_COLORMAP[label_id % len(LABEL_COLORMAP)]
             item = self.uniqLabelList.findItemByLabel(label)
             if item is None:
                 item = self.uniqLabelList.createItemFromLabel(label)
@@ -2841,8 +3148,11 @@ class MainWindow(QtWidgets.QMainWindow):
             shape_type = shape["shape_type"]
             flags = shape["flags"]
             description = shape.get("description", "")
-            group_id = shape["group_id"]
-            track_id = shape.get("track_id") or group_id
+            group_id = shape.get("group_id")
+            track_id = shape.get("track_id")
+            other_data = dict(shape.get("other_data", {}))
+            if track_id is None or track_id == "":
+                track_id = group_id
 
             if not points:
                 # skip point-empty shape
@@ -2851,7 +3161,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if (
                 self.ir_activated
                 and label == self.ir_name
-                and track_id == self.ir_id
+                and str(track_id) == str(self.ir_id)
             ):
                 deltas = [
                     [
@@ -2883,6 +3193,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 description=description,
                 mask=shape["mask"],
             )
+            shape.other_data = other_data
             for x, y in points:
                 shape.addPoint(QtCore.QPointF(x, y))
             shape.close()
@@ -2911,20 +3222,17 @@ class MainWindow(QtWidgets.QMainWindow):
         lf = LabelFile()
 
         def format_shape(s):
-            data = s.other_data.copy()
-            data.update(
-                dict(
-                    label=s.label.encode("utf-8") if PY2 else s.label,
-                    points=[(p.x(), p.y()) for p in s.points],
-                    group_id=s.group_id,
-                    track_id=s.track_id,
-                    description=s.description,
-                    shape_type=s.shape_type,
-                    flags=s.flags,
-                    mask=None if s.mask is None else utils.img_arr_to_b64(s.mask),
-                )
+            return dict(
+                label=s.label.encode("utf-8") if PY2 else s.label,
+                points=[(p.x(), p.y()) for p in s.points],
+                group_id=s.group_id,
+                track_id=s.track_id,
+                description=s.description,
+                shape_type=s.shape_type,
+                flags=s.flags,
+                mask=None if s.mask is None else utils.img_arr_to_b64(s.mask),
+                other_data=s.other_data.copy(),
             )
-            return data
 
         shapes = [format_shape(item.shape()) for item in self.labelList]
         flags = {}
@@ -2944,8 +3252,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 osp.join(label_dir, relative_image_path)
             ):
                 imagePath = relative_image_path
-            # imageData = self.imageData if self._config["store_data"] else None
-            imageData = None
+            imageData = self.imageData if self._config["store_data"] else None
             if osp.dirname(filename) and not osp.exists(osp.dirname(filename)):
                 os.makedirs(osp.dirname(filename))
             lf.save(
@@ -2955,10 +3262,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 imageData=imageData,
                 imageHeight=self.image.height(),
                 imageWidth=self.image.width(),
+                otherData=self.otherData or {},
                 flags=flags,
             )
             self.labelFile = lf
-            items = self.fileListWidget.findItems(self.imagePath, Qt.MatchExactly)
+            items = self.fileListWidget.findItems(self.filename, Qt.MatchExactly)
             if len(items) > 0:
                 if len(items) != 1:
                     raise RuntimeError("There are duplicate files.")
@@ -2966,7 +3274,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # disable allows next and previous image to proceed
             # self.filename = filename
             return True
-        except LabelFileError as e:
+        except (LabelFileError, OSError, ValueError) as e:
             self.errorMessage(
                 self.tr("Error saving label data"), self.tr("<b>%s</b>") % e
             )
@@ -3011,12 +3319,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.canvas.deSelectShape()
 
     def labelItemChanged(self, item):
-        shape = item.shape()
-        self.canvas.setShapeVisible(shape, item.checkState() == Qt.Checked)
+        self._setShapeVisibility(item.shape(), item.checkState(), self.IDList)
 
     def IDItemChanged(self, item):
-        shape = item.shape()
-        self.canvas.setShapeVisible(shape, item.checkState() == Qt.Checked)
+        self._setShapeVisibility(item.shape(), item.checkState(), self.labelList)
+
+    def _setShapeVisibility(self, shape, check_state, counterpart_list):
+        if self._syncing_visibility:
+            return
+        self._syncing_visibility = True
+        try:
+            try:
+                counterpart = counterpart_list.findItemByShape(shape)
+            except ValueError:
+                counterpart = None
+            if counterpart is not None and counterpart.checkState() != check_state:
+                counterpart.setCheckState(check_state)
+            self.canvas.setShapeVisible(shape, check_state == Qt.Checked)
+        finally:
+            self._syncing_visibility = False
 
     def labelOrderChanged(self):
         self.setDirty()
@@ -3208,44 +3529,42 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def loadFile(self, filename=None):
         """Load the specified file, or the last opened file if None."""
-        self._flushPendingAutoSave()
-        # changing fileListWidget loads file
+        if not self._flushPendingAutoSave():
+            return False
+        # Keep the list selection aligned without recursively re-entering this method.
         if filename in self.imageList and (
             self.fileListWidget.currentRow() != self.imageList.index(filename)
         ):
-            self.fileListWidget.setCurrentRow(self.imageList.index(filename))
-            return
+            self.fileListWidget.blockSignals(True)
+            try:
+                self.fileListWidget.setCurrentRow(self.imageList.index(filename))
+            finally:
+                self.fileListWidget.blockSignals(False)
 
-        prev_shapes = list(self.canvas.shapes) if self._config["keep_prev"] else []
-        self.resetState()
-        self.canvas.setEnabled(False)
         if filename is None:  # image file name .jpg
             filename = self.settings.value("filename", "")
-        filename = str(filename)
+        filename = osp.abspath(str(filename))
         if not QtCore.QFile.exists(filename):
             self.errorMessage(
                 self.tr("Error opening file"),
                 self.tr("No such file: <b>%s</b>") % filename,
             )
             return False
-        # assumes same name, but json extension
         self.status(str(self.tr("Loading %s...")) % osp.basename(str(filename)))
-
-        label_file = osp.splitext(filename)[0] + ".json"
-
-        if self.lastOpenDir:
-            alt = osp.join(self.lastOpenDir, osp.basename(label_file))
-            if os.path.isfile(alt):
-                label_file = alt
-
-        if self.output_dir:
-            label_file_without_path = osp.basename(label_file)
-            label_file = osp.join(self.output_dir, label_file_without_path)
+        explicit_label_path = filename if LabelFile.is_label_file(filename) else None
+        label_file = explicit_label_path or self._resolveJsonPath(
+            image_path=filename, for_write=False
+        )
+        loaded_label_file = None
+        loaded_image_data = None
+        loaded_image_path = filename
+        loaded_other_data = None
+        actual_filename = filename
         if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(
             label_file
         ):  # check if label_file exists and has correct type
             try:
-                self.labelFile = LabelFile(label_file)  # FIX LabelFile HERE
+                loaded_label_file = LabelFile(label_file)
             except LabelFileError as e:
                 self.errorMessage(
                     self.tr("Error opening file"),
@@ -3256,30 +3575,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 self.status(self.tr("Error reading %s") % label_file)
                 return False
-            self.ir_old_shapes = list(self.labelFile.shapes)
-            self.imageData = self.labelFile.imageData
-            self.labelFile.imageData = None
-            self.imagePath = osp.join(
-                osp.dirname(label_file),
-                self.labelFile.imagePath,
+            loaded_image_data = loaded_label_file.imageData
+            referenced_image_path = loaded_label_file.imagePath
+            if not isinstance(referenced_image_path, str) or not referenced_image_path:
+                self.errorMessage(
+                    self.tr("Error opening file"),
+                    self.tr("Label file has no valid imagePath: %s") % label_file,
+                )
+                return False
+            if not osp.isabs(referenced_image_path):
+                referenced_image_path = osp.join(
+                    osp.dirname(label_file), referenced_image_path
+                )
+            referenced_image_path = osp.abspath(osp.normpath(referenced_image_path))
+            loaded_image_path = (
+                referenced_image_path if explicit_label_path else filename
             )
-            self.otherData = self.labelFile.otherData  # dont care
-            if self.imageData is None:
-                self.imageData = LabelFile.load_image_file(filename)
+            loaded_other_data = loaded_label_file.otherData
+            if loaded_image_data is None:
+                loaded_image_data = LabelFile.load_image_file(loaded_image_path)
+            if explicit_label_path and osp.isfile(referenced_image_path):
+                actual_filename = referenced_image_path
         else:
-            self.ir_old_shapes = []
-            self.imageData = LabelFile.load_image_file(filename)
-            if self.imageData:
-                self.imagePath = filename
-            self.labelFile = None
-        if self.imageData is None:
+            loaded_image_data = LabelFile.load_image_file(filename)
+        if loaded_image_data is None:
             self.errorMessage(
                 self.tr("Error opening file"),
-                self.tr("Cannot read image: %s") % filename,
+                self.tr("Cannot read image: %s") % actual_filename,
             )
-            self.status(self.tr("Error reading %s") % filename)
+            self.status(self.tr("Error reading %s") % actual_filename)
             return False
-        image = QtGui.QImage.fromData(self.imageData)
+        image = QtGui.QImage.fromData(loaded_image_data)
 
         if image.isNull():
             formats = [
@@ -3291,12 +3617,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.tr(
                     "<p>Make sure <i>{0}</i> is a valid image file.<br/>"
                     "Supported image formats: {1}</p>"
-                ).format(filename, ",".join(formats)),
+                ).format(actual_filename, ",".join(formats)),
             )
-            self.status(self.tr("Error reading %s") % filename)
+            self.status(self.tr("Error reading %s") % actual_filename)
             return False
+
+        prev_shapes = list(self.canvas.shapes) if self._config["keep_prev"] else []
+        self.resetState(release_ai_model=False)
+        self.canvas.setEnabled(False)
+        self.labelFile = loaded_label_file
+        self.ir_old_shapes = (
+            list(loaded_label_file.shapes) if loaded_label_file is not None else []
+        )
+        self.imageData = loaded_image_data
+        self.imagePath = loaded_image_path
+        self.otherData = loaded_other_data
         self.image = image  # image data
-        self.filename = filename
+        self.filename = actual_filename
+        self._explicit_label_path = explicit_label_path
         self.canvas.loadPixmap(QtGui.QPixmap.fromImage(image))
         flags = {k: False for k in self._config["flags"] or []}
         if self.labelFile:  # if labelFile exists
@@ -3361,7 +3699,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addRecentFile(self.filename)
         self.toggleActions(True)
         self.canvas.setFocus()
-        self.status(str(self.tr("Loaded %s")) % osp.basename(str(filename)))
+        self.status(str(self.tr("Loaded %s")) % osp.basename(str(self.filename)))
         return True
 
     def resizeEvent(self, event):
@@ -3406,14 +3744,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self._config["store_data"] = enabled
         self.actions.saveWithImageData.setChecked(enabled)
 
+    def enableAutoSave(self, enabled):
+        self._config["auto_save"] = bool(enabled)
+        self.actions.saveAuto.setChecked(bool(enabled))
+        if enabled and self.dirty and self.filename:
+            self._pending_auto_save_filename = self.filename
+            self._pending_auto_save_target = self._resolveJsonPath(for_write=True)
+            self._save_timer.start()
+        elif not enabled:
+            self._save_timer.stop()
+            self._pending_auto_save_filename = None
+            self._pending_auto_save_target = None
+
     def closeEvent(self, event):
+        if self._tracking_thread is not None and self._tracking_thread.isRunning():
+            self._close_after_tracking = True
+            self._cancelTrackingWorker()
+            self.status("Canceling the active tracking operation before closing...")
+            event.ignore()
+            return
+        if (
+            self._hosted_sam2_thread is not None
+            and self._hosted_sam2_thread.isRunning()
+        ):
+            self._close_after_hosted_request = True
+            self.status("Waiting for the active hosted SAM2 request to finish...")
+            event.ignore()
+            return
         if not self.mayContinue():
             event.ignore()
+            return
         self.settings.setValue("filename", self.filename if self.filename else "")
         self.settings.setValue("window/size", self.size())
         self.settings.setValue("window/position", self.pos())
         self.settings.setValue("window/state", self.saveState())
         self.settings.setValue("recentFiles", self.recentFiles)
+        self._hosted_sam2_image_cache.clear()
+        close_client = getattr(self._hosted_sam2_client, "close", None)
+        if close_client is not None:
+            close_client()
+        self.canvas.releaseAiModel()
+        event.accept()
         # ask the use for where to save the labels
         # self.settings.setValue('window/geometry', self.saveGeometry())
 
@@ -3499,25 +3870,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 and self.ir_name != "None"
                 and self.ir_id != "None"
             ):
-                found = False
+                old_found = False
+                modified_found = False
                 # original
                 for item in self.ir_old_shapes:
-                    if item["label"] == self.ir_name and item["track_id"] == self.ir_id:
+                    if item["label"] == self.ir_name and str(
+                        shape_track_id(item)
+                    ) == str(self.ir_id):
                         self.ir_old_shape = item["points"]
+                        old_found = True
                 # modified
                 for item in self.labelList:
-                    if (
-                        item.shape().label == self.ir_name
-                        and item.shape().track_id == self.ir_id
-                    ):
-                        found = True
+                    if item.shape().label == self.ir_name and str(
+                        item.shape().track_id
+                    ) == str(self.ir_id):
+                        modified_found = True
                         self.ir_mod_shape = [
                             [p.x(), p.y()] for p in item.shape().points
                         ]
-                if not found:
+                if not (old_found and modified_found):
                     self.ir_old_shape = "None"
                     self.ir_mod_shape = "None"
-                self.ir_activated = True
+                self.ir_activated = old_found and modified_found
             else:
                 self.ir_activated = False
 
@@ -3530,10 +3904,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     filename = self.imageList[currIndex + 1]
                 else:
                     filename = self.imageList[-1]
-            self.filename = filename
-
-            if self.filename and load:
-                self.loadFile(self.filename)
+            if filename and load:
+                self.loadFile(filename)
 
             self._config["keep_prev"] = keep_prev
         else:
@@ -3542,10 +3914,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 filename = self.INTERPOLATION_list[currIndex + 1]
             else:
                 filename = self.INTERPOLATION_list[-1]
-            self.filename = filename
-
-            if self.filename and load:
-                self.loadFile(self.filename)
+            if filename and load:
+                self.loadFile(filename)
 
             self._config["keep_prev"] = keep_prev
 
@@ -3574,6 +3944,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.loadFile(fileName)
 
     def changeOutputDirDialog(self, _value=False):
+        if not self.mayContinue():
+            return
         default_output_dir = self.output_dir
         if default_output_dir is None and self.filename:
             default_output_dir = osp.dirname(self.filename)
@@ -3611,14 +3983,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def saveFile(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
         if self.output_file:
-            self._saveFile(self.output_file)
-            self.close()
-        else:
-            self._saveFile(self._resolveJsonPath())
+            saved = self._saveFile(self.output_file)
+            if saved:
+                self.close()
+            return saved
+        return self._saveFile(self._resolveJsonPath(for_write=True))
 
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
-        self._saveFile(self.saveFileDialog())
+        return self._saveFile(self.saveFileDialog())
 
     def saveFileDialog(self):
         caption = self.tr("%s - Choose File") % __appname__
@@ -3631,12 +4004,10 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.setAcceptMode(QtWidgets.QFileDialog.AcceptSave)
         dlg.setOption(QtWidgets.QFileDialog.DontConfirmOverwrite, False)
         dlg.setOption(QtWidgets.QFileDialog.DontUseNativeDialog, False)
-        basename = osp.basename(osp.splitext(self.filename)[0])
         if self.output_dir:
-            default_labelfile_name = osp.join(
-                self.output_dir, basename + LabelFile.suffix
-            )
+            default_labelfile_name = self._resolveJsonPath(for_write=True)
         else:
+            basename = osp.basename(osp.splitext(self.filename)[0])
             default_labelfile_name = osp.join(
                 self.currentPath(), basename + LabelFile.suffix
             )
@@ -3654,6 +4025,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if filename and self.saveLabels(filename):
             self.addRecentFile(filename)
             self.setClean()
+            return True
+        return False
 
     def closeFile(self, _value=False):
         if not self.mayContinue():
@@ -3665,12 +4038,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.saveAs.setEnabled(False)
 
     def getLabelFile(self):
-        if self.filename.lower().endswith(".json"):
-            label_file = self.filename
-        else:
-            label_file = osp.splitext(self.filename)[0] + ".json"
-
-        return label_file
+        return self._resolveJsonPath(for_write=False)
 
     def deleteFile(self):
         mb = QtWidgets.QMessageBox
@@ -3683,13 +4051,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         label_file = self.getLabelFile()
         if osp.exists(label_file):
-            os.remove(label_file)
+            try:
+                os.remove(label_file)
+            except OSError as exc:
+                self.errorMessage(self.tr("Error deleting label data"), str(exc))
+                return
             logger.info("Label file is removed: {}".format(label_file))
 
             item = self.fileListWidget.currentItem()
-            item.setCheckState(Qt.Unchecked)
+            if item is not None:
+                item.setCheckState(Qt.Unchecked)
 
+            self._save_timer.stop()
+            self._pending_auto_save_filename = None
+            self._pending_auto_save_target = None
             self.resetState()
+            self.setClean()
+            self.toggleActions(False)
+            self.canvas.setEnabled(False)
 
     # Message Dialogs. #
     def hasLabels(self):
@@ -3709,6 +4088,12 @@ class MainWindow(QtWidgets.QMainWindow):
         return osp.exists(label_file)
 
     def mayContinue(self):
+        if getattr(self, "filename", None) is None:
+            return True
+        if getattr(self, "_save_timer", None) is not None:
+            if self._save_timer.isActive() and self._flushPendingAutoSave():
+                if not self.dirty:
+                    return True
         if not self.dirty:
             return True
         mb = QtWidgets.QMessageBox
@@ -3721,10 +4106,12 @@ class MainWindow(QtWidgets.QMainWindow):
             mb.Save,
         )
         if answer == mb.Discard:
+            self._save_timer.stop()
+            self._pending_auto_save_filename = None
+            self._pending_auto_save_target = None
             return True
         elif answer == mb.Save:
-            self.saveFile()
-            return True
+            return bool(self.saveFile())
         else:  # answer == mb.Cancel
             return False
 
@@ -3826,14 +4213,28 @@ class MainWindow(QtWidgets.QMainWindow):
             for fmt in QtGui.QImageReader.supportedImageFormats()
         ]
 
-        self.filename = None
+        imageFiles = [
+            osp.abspath(file)
+            for file in imageFiles
+            if file.lower().endswith(tuple(extensions))
+        ]
+        if not self.lastOpenDir and imageFiles:
+            try:
+                self.lastOpenDir = osp.commonpath(
+                    [osp.dirname(file) for file in imageFiles]
+                )
+            except ValueError:
+                self.lastOpenDir = None
+        all_image_files = list(self.imageList) + imageFiles
+        added_files = []
         for file in imageFiles:
-            if file in self.imageList or not file.lower().endswith(tuple(extensions)):
+            if file in self.imageList:
                 continue
-            label_file = osp.splitext(file)[0] + ".json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
+            label_file = self._resolveJsonPath(
+                image_path=file,
+                for_write=False,
+                image_paths=all_image_files,
+            )
             item = QtWidgets.QListWidgetItem(file)
             item.setFlags(
                 Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
@@ -3844,12 +4245,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setCheckState(Qt.Unchecked)
             self.fileListWidget.addItem(item)
             self._imageListCache = None
+            added_files.append(file)
 
         if len(self.imageList) > 1:
             self.actions.openNextImg.setEnabled(True)
             self.actions.openPrevImg.setEnabled(True)
 
-        self.openNextImg()
+        if added_files:
+            self.loadFile(added_files[0])
 
     def importDirImages(self, dirpath, pattern=None, load=True):
         self.actions.openNextImg.setEnabled(True)
@@ -3858,8 +4261,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.mayContinue() or not dirpath:
             return
 
-        self.lastOpenDir = dirpath
-        self.filename = None
+        current_filename = getattr(self, "filename", None)
+        self.lastOpenDir = osp.abspath(dirpath)
         self.fileListWidget.clear()
 
         filenames = self.scanAllImages(dirpath)
@@ -3869,10 +4272,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except re.error:
                 pass
         for filename in filenames:
-            label_file = osp.splitext(filename)[0] + ".json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
+            label_file = self._resolveJsonPath(
+                image_path=filename, for_write=False, image_paths=filenames
+            )
             item = QtWidgets.QListWidgetItem(filename)
             item.setFlags(
                 Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
@@ -3883,7 +4285,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.setCheckState(Qt.Unchecked)
             self.fileListWidget.addItem(item)
         self._imageListCache = None
-        self.openNextImg(load=load)
+        if load:
+            if filenames and not self.loadFile(filenames[0]):
+                self._restoreCurrentFileSelection()
+        else:
+            self.filename = current_filename
 
     def scanAllImages(self, folderPath):
         extensions = [

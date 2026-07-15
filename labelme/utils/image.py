@@ -5,6 +5,7 @@ import numpy as np
 import PIL.ExifTags
 import PIL.Image
 import PIL.ImageOps
+from qtpy import QtGui
 
 
 def img_data_to_pil(img_data):
@@ -57,10 +58,13 @@ def img_data_to_png_data(img_data):
 
 
 def img_qt_to_arr(img_qt):
-    w, h, d = img_qt.size().width(), img_qt.size().height(), img_qt.depth()
-    bytes_ = img_qt.bits().asstring(w * h * d // 8)
-    img_arr = np.frombuffer(bytes_, dtype=np.uint8).reshape((h, w, d // 8))
-    return img_arr
+    image = img_qt.convertToFormat(QtGui.QImage.Format_RGB888)
+    width = image.width()
+    height = image.height()
+    bytes_per_line = image.bytesPerLine()
+    data = image.bits().asstring(height * bytes_per_line)
+    rows = np.frombuffer(data, dtype=np.uint8).reshape(height, bytes_per_line)
+    return rows[:, : width * 3].reshape(height, width, 3).copy()
 
 
 def apply_exif_orientation(image):

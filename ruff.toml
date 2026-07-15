@@ -1,6 +1,7 @@
 exclude = [
   ".conda",
   ".git",
+  ".worktrees",
   "src",
 ]
 
@@ -29,5 +30,5 @@ skip-magic-trailing-comma = false
 # Like Black, automatically detect the appropriate line ending.
 line-ending = "auto"
 
-[isort]
+[lint.isort]
 force-single-line = true
