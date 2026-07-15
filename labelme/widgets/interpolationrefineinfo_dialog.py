@@ -7,11 +7,11 @@ class InterpolationRefineInfo_Dialog(QtWidgets.QDialog):
         self.setModal(True)
         self.setWindowTitle("Association Options")
         self.name = "None"
-        self.ID = "None"
-        
+        self.id = "None"
+
         self.name_cell = QtWidgets.QLineEdit()
         self.id_cell = QtWidgets.QLineEdit()
-        
+
         row1 = QtWidgets.QHBoxLayout()
         row1.addWidget(QtWidgets.QLabel("Name:"))
         row1.addStretch()
@@ -21,7 +21,7 @@ class InterpolationRefineInfo_Dialog(QtWidgets.QDialog):
         row2.addWidget(QtWidgets.QLabel("ID:"))
         row2.addStretch()
         row2.addWidget(self.id_cell)
-        
+
         self.button = QtWidgets.QPushButton("Finish")
         self.button.clicked.connect(self.get_info)
 
@@ -30,11 +30,11 @@ class InterpolationRefineInfo_Dialog(QtWidgets.QDialog):
         layout.addLayout(row2)
         layout.addWidget(self.button)
         self.setLayout(layout)
-        
+
     def get_info(self):
-        self.name = self.name_cell.text()
-        self.id = self.id_cell.text()
+        self.name = self.name_cell.text().strip()
+        self.id = self.id_cell.text().strip()
+        if not self.name or not self.id:
+            return
 
         self.accept()
-
-

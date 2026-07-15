@@ -1,3 +1,4 @@
+import os
 import os.path as osp
 import shutil
 
@@ -8,12 +9,18 @@ from labelme.logger import logger
 here = osp.dirname(osp.abspath(__file__))
 
 
+def get_user_config_file():
+    return os.environ.get(
+        "LABELME_CONFIG_FILE", osp.join(osp.expanduser("~"), ".labelmerc")
+    )
+
+
 def update_dict(target_dict, new_dict, validate_item=None):
     for key, value in new_dict.items():
         if validate_item:
             validate_item(key, value)
         if key not in target_dict:
-            logger.warn("Skipping unexpected key in config: {}".format(key))
+            logger.warning("Skipping unexpected key in config: {}".format(key))
             continue
         if isinstance(target_dict[key], dict) and isinstance(value, dict):
             update_dict(target_dict[key], value, validate_item=validate_item)
@@ -30,12 +37,12 @@ def get_default_config():
         config = yaml.safe_load(f)
 
     # save default config to ~/.labelmerc
-    user_config_file = osp.join(osp.expanduser("~"), ".labelmerc")
+    user_config_file = get_user_config_file()
     if not osp.exists(user_config_file):
         try:
             shutil.copy(config_file, user_config_file)
         except Exception:
-            logger.warn("Failed to save config: {}".format(user_config_file))
+            logger.warning("Failed to save config: {}".format(user_config_file))
 
     return config
 
@@ -46,9 +53,7 @@ def validate_config_item(key, value):
             "Unexpected value for config key 'validate_label': {}".format(value)
         )
     if key == "theme" and value not in [None, "system", "light", "dark"]:
-        raise ValueError(
-            "Unexpected value for config key 'theme': {}".format(value)
-        )
+        raise ValueError("Unexpected value for config key 'theme': {}".format(value))
     if key == "shape_color" and value not in [None, "auto", "manual"]:
         raise ValueError(
             "Unexpected value for config key 'shape_color': {}".format(value)

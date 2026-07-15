@@ -106,9 +106,7 @@ def test_LabelDialog_popUp_moves_off_cursor_and_stays_on_screen(qtbot, monkeypat
     cursor_pos = QtCore.QPoint(190, 190)
     monkeypatch.setattr(QtGui.QCursor, "pos", lambda: cursor_pos)
     monkeypatch.setattr(QtGui.QGuiApplication, "screenAt", lambda _pos: FakeScreen())
-    monkeypatch.setattr(
-        QtGui.QGuiApplication, "primaryScreen", lambda: FakeScreen()
-    )
+    monkeypatch.setattr(QtGui.QGuiApplication, "primaryScreen", lambda: FakeScreen())
     monkeypatch.setattr(widget, "exec_", lambda: 0)
 
     widget.popUp("cat")

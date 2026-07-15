@@ -1,7 +1,8 @@
-fastapi
+fastapi>=0.115
 uvicorn[standard]
 python-multipart
 numpy
 pillow
+pydantic>=2.7
 torch
 torchvision

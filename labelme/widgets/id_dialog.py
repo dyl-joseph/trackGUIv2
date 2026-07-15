@@ -1,13 +1,16 @@
-
 from qtpy import QT_VERSION
 from qtpy import QtCore
-from qtpy import QtGui
 from qtpy import QtWidgets
 
 import labelme.utils
 from labelme.logger import logger
+from labelme.widgets.popup_position import move_to_safe_cursor_position
 
 QT5 = QT_VERSION[0] == "5"
+
+
+def _id_text(value):
+    return "" if value is None else str(value)
 
 
 # TODO(unknown):
@@ -68,7 +71,7 @@ class IDDialog(QtWidgets.QDialog):
             self.IDList.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self._sort_labels = sort_ids
         if ids:
-            self.IDList.addItems(ids)
+            self.IDList.addItems([_id_text(value) for value in ids])
         if self._sort_labels:
             self.IDList.sortItems()
         else:
@@ -102,6 +105,9 @@ class IDDialog(QtWidgets.QDialog):
         self.edit.setCompleter(completer)
 
     def addIDHistory(self, id):
+        id = _id_text(id)
+        if not id.strip():
+            return
         if self.IDList.findItems(id, QtCore.Qt.MatchExactly):
             return
         self.IDList.addItem(id)
@@ -143,8 +149,9 @@ class IDDialog(QtWidgets.QDialog):
         # if text is None, the previous label in self.edit is kept
         if text is None:
             text = self.edit.text()
+        else:
+            text = _id_text(text)
         self.edit.setText(text)
-        self.edit.setSelection(0, len(text))
 
         items = self.IDList.findItems(text, QtCore.Qt.MatchFixedString)
         if items:
@@ -153,10 +160,11 @@ class IDDialog(QtWidgets.QDialog):
             self.IDList.setCurrentItem(items[0])
             row = self.IDList.row(items[0])
             self.edit.completer().setCurrentRow(row)
+        self.edit.setSelection(0, len(text))
 
         self.edit.setFocus(QtCore.Qt.PopupFocusReason)
         if move:
-            self.move(QtGui.QCursor.pos())
+            move_to_safe_cursor_position(self, self.IDList)
         if self.exec_():
             return self.edit.text()
         else:

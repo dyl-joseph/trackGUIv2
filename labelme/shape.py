@@ -90,7 +90,12 @@ class Shape(object):
         self._cached_mask_key = None
 
     def setShapeRefined(self, shape_type, points, point_labels, mask=None):
-        self._shape_raw = (self.shape_type, self.points, self.point_labels)
+        self._shape_raw = (
+            self.shape_type,
+            self.points,
+            self.point_labels,
+            None if self.mask is None else self.mask.copy(),
+        )
         self.shape_type = shape_type
         self.points = points
         self.point_labels = point_labels
@@ -100,7 +105,7 @@ class Shape(object):
     def restoreShapeRaw(self):
         if self._shape_raw is None:
             return
-        self.shape_type, self.points, self.point_labels = self._shape_raw
+        self.shape_type, self.points, self.point_labels, self.mask = self._shape_raw
         self._shape_raw = None
         self._invalidate_cache()
 
@@ -258,17 +263,13 @@ class Shape(object):
             oy = int(round(self.points[0].y()))
             cache_key = (id(self.mask), fill_color, ox, oy)
             if self._cached_mask_key != cache_key:
-                image_to_draw = np.zeros(
-                    self.mask.shape + (4,), dtype=np.uint8
-                )
+                image_to_draw = np.zeros(self.mask.shape + (4,), dtype=np.uint8)
                 image_to_draw[self.mask] = fill_color
                 self._cached_mask_qimage = QtGui.QImage.fromData(
                     labelme.utils.img_arr_to_data(image_to_draw)
                 )
                 line_path = QtGui.QPainterPath()
-                contours = skimage.measure.find_contours(
-                    np.pad(self.mask, pad_width=1)
-                )
+                contours = skimage.measure.find_contours(np.pad(self.mask, pad_width=1))
                 for contour in contours:
                     contour += [self.points[0].y(), self.points[0].x()]
                     line_path.moveTo(contour[0, 1], contour[0, 0])
@@ -377,7 +378,8 @@ class Shape(object):
     def nearestEdge(self, point, epsilon):
         min_distance = float("inf")
         post_i = None
-        for i in range(len(self.points)):
+        first_edge = 1 if self.shape_type == "linestrip" else 0
+        for i in range(first_edge, len(self.points)):
             line = [self.points[i - 1], self.points[i]]
             dist = labelme.utils.distancetoline(point, line)
             if dist <= epsilon and dist < min_distance:
@@ -387,17 +389,13 @@ class Shape(object):
 
     def containsPoint(self, point):
         if self.mask is not None:
-            y = np.clip(
-                int(round(point.y() - self.points[0].y())),
-                0,
-                self.mask.shape[0] - 1,
-            )
-            x = np.clip(
-                int(round(point.x() - self.points[0].x())),
-                0,
-                self.mask.shape[1] - 1,
-            )
-            return self.mask[y, x]
+            local_y = point.y() - self.points[0].y()
+            local_x = point.x() - self.points[0].x()
+            if not (
+                0 <= local_y < self.mask.shape[0] and 0 <= local_x < self.mask.shape[1]
+            ):
+                return False
+            return self.mask[int(local_y), int(local_x)]
         return self.makePath().contains(point)
 
     def getCircleRectFromLine(self, line):
@@ -464,7 +462,7 @@ class Shape(object):
             group_id=self.group_id,
             track_id=self.track_id,
             description=self.description,
-            mask=self.mask,
+            mask=None if self.mask is None else self.mask.copy(),
         )
         s.points = [QtCore.QPointF(p) for p in self.points]
         s.point_labels = list(self.point_labels)
@@ -473,11 +471,12 @@ class Shape(object):
         s._closed = self._closed
         s.other_data = self.other_data.copy()
         if self._shape_raw is not None:
-            raw_type, raw_pts, raw_labels = self._shape_raw
+            raw_type, raw_pts, raw_labels, raw_mask = self._shape_raw
             s._shape_raw = (
                 raw_type,
                 [QtCore.QPointF(p) for p in raw_pts],
                 list(raw_labels),
+                None if raw_mask is None else raw_mask.copy(),
             )
         if hasattr(self, "line_color") and "line_color" in self.__dict__:
             s.line_color = self.line_color

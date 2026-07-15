@@ -12,4 +12,4 @@ format:
 	ruff check --fix
 
 test:
-	MPLBACKEND='agg' pytest tests
+	MPLBACKEND='agg' QT_QPA_PLATFORM='offscreen' pytest

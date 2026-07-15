@@ -1,4 +1,5 @@
 import json
+import os
 
 from qtpy import QtCore
 from qtpy import QtGui
@@ -18,6 +19,8 @@ class ScrollAreaPreview(QtWidgets.QScrollArea):
 
         self.label = QtWidgets.QLabel(content)
         self.label.setWordWrap(True)
+        self.label.setTextFormat(QtCore.Qt.PlainText)
+        self.label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
         lay.addWidget(self.label)
 
@@ -50,9 +53,17 @@ class FileDialogPreview(QtWidgets.QFileDialog):
 
     def onChange(self, path):
         if path.lower().endswith(".json"):
-            with open(path, "r") as f:
-                data = json.load(f)
-                self.labelPreview.setText(json.dumps(data, indent=4, sort_keys=False))
+            try:
+                if os.path.getsize(path) > 1024 * 1024:
+                    raise ValueError("JSON preview is limited to 1 MiB")
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                preview = json.dumps(data, indent=4, sort_keys=False)
+                if len(preview) > 64 * 1024:
+                    preview = preview[: 64 * 1024] + "\n… preview truncated …"
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                preview = "Unable to preview JSON: {}".format(exc)
+            self.labelPreview.setText(preview)
             self.labelPreview.label.setAlignment(
                 QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop
             )

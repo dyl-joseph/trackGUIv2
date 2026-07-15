@@ -5,6 +5,7 @@ import collections
 import datetime
 import glob
 import json
+import math
 import os
 import os.path as osp
 import sys
@@ -18,11 +19,95 @@ import labelme
 try:
     import pycocotools.mask
 except ImportError:
-    print("Please install pycocotools:\n\n    pip install pycocotools\n")
-    sys.exit(1)
+    pycocotools = None
+
+
+def load_categories(filename):
+    """Return positive COCO category IDs, excluding LabelMe sentinels."""
+    with open(filename, encoding="utf-8") as handle:
+        class_names = [line.strip() for line in handle if line.strip()]
+    class_name_to_id = {}
+    for class_name in class_names:
+        if class_name in {"__ignore__", "_background_", "__background__"}:
+            continue
+        if class_name in class_name_to_id:
+            raise ValueError("Duplicate category name: {}".format(class_name))
+        class_name_to_id[class_name] = len(class_name_to_id) + 1
+    return class_name_to_id
+
+
+def find_label_files(input_dir):
+    pattern = osp.join(osp.abspath(input_dir), "**", "*.json")
+    files = glob.glob(pattern, recursive=True)
+    return sorted(
+        filename
+        for filename in files
+        if not any(
+            part.startswith(".")
+            for part in osp.relpath(filename, input_dir).replace("\\", "/").split("/")
+        )
+    )
+
+
+def relative_output_stem(filename, input_dir):
+    relative = osp.relpath(osp.abspath(filename), osp.abspath(input_dir))
+    return osp.splitext(relative)[0]
+
+
+def portable_dataset_path(path):
+    """Normalize a serialized dataset path to COCO's portable separators."""
+    return str(path).replace("\\", "/")
+
+
+def ensure_parent(filename):
+    os.makedirs(osp.dirname(filename), exist_ok=True)
+
+
+def shape_points_are_finite(shape):
+    try:
+        points = np.asarray(shape.get("points", []), dtype=float)
+    except (TypeError, ValueError):
+        return False
+    return points.ndim == 2 and points.shape[1:] == (2,) and np.isfinite(points).all()
+
+
+def shape_geometry_is_valid(shape):
+    if not shape_points_are_finite(shape):
+        return False
+    points = np.asarray(shape.get("points"), dtype=float)
+    shape_type = shape.get("shape_type", "polygon")
+    if shape_type == "polygon":
+        if len(points) < 3:
+            return False
+        x = points[:, 0]
+        y = points[:, 1]
+        area_twice = np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))
+        return not np.isclose(area_twice, 0.0)
+    if shape_type == "rectangle":
+        return (
+            len(points) == 2
+            and points[0, 0] != points[1, 0]
+            and points[0, 1] != points[1, 1]
+        )
+    if shape_type == "circle":
+        return len(points) == 2 and not np.array_equal(points[0], points[1])
+    if shape_type == "line":
+        return len(points) == 2 and not np.array_equal(points[0], points[1])
+    if shape_type == "linestrip":
+        return len(points) >= 2 and np.any(np.diff(points, axis=0) != 0)
+    if shape_type == "point":
+        return len(points) == 1
+    if shape_type == "points":
+        return len(points) >= 1
+    if shape_type == "mask":
+        return len(points) >= 1 and shape.get("mask") is not None
+    return False
 
 
 def main():
+    if pycocotools is None:
+        print("Please install pycocotools:\n\n    pip install pycocotools\n")
+        sys.exit(1)
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -71,14 +156,8 @@ def main():
         ],
     )
 
-    class_name_to_id = {}
-    for i, line in enumerate(open(args.labels).readlines()):
-        class_id = i - 1  # starts with -1
-        class_name = line.strip()
-        if class_id == -1:
-            assert class_name == "__ignore__"
-            continue
-        class_name_to_id[class_name] = class_id
+    class_name_to_id = load_categories(args.labels)
+    for class_name, class_id in class_name_to_id.items():
         data["categories"].append(
             dict(
                 supercategory=None,
@@ -88,14 +167,15 @@ def main():
         )
 
     out_ann_file = osp.join(args.output_dir, "annotations.json")
-    label_files = glob.glob(osp.join(args.input_dir, "*.json"))
-    for image_id, filename in enumerate(label_files):
+    label_files = find_label_files(args.input_dir)
+    for image_id, filename in enumerate(label_files, start=1):
         print("Generating dataset from:", filename)
 
         label_file = labelme.LabelFile(filename=filename)
 
-        base = osp.splitext(osp.basename(filename))[0]
-        out_img_file = osp.join(args.output_dir, "JPEGImages", base + ".jpg")
+        relative_stem = relative_output_stem(filename, args.input_dir)
+        out_img_file = osp.join(args.output_dir, "JPEGImages", relative_stem + ".jpg")
+        ensure_parent(out_img_file)
 
         img = labelme.utils.img_data_to_arr(label_file.imageData)
         imgviz.io.imsave(out_img_file, img)
@@ -103,7 +183,9 @@ def main():
             dict(
                 license=0,
                 url=None,
-                file_name=osp.relpath(out_img_file, osp.dirname(out_ann_file)),
+                file_name=portable_dataset_path(
+                    osp.relpath(out_img_file, osp.dirname(out_ann_file))
+                ),
                 height=img.shape[0],
                 width=img.shape[1],
                 date_captured=None,
@@ -113,12 +195,26 @@ def main():
 
         masks = {}  # for area
         segmentations = collections.defaultdict(list)  # for segmentation
+        requires_rle = collections.defaultdict(bool)
         for shape in label_file.shapes:
+            if not shape_geometry_is_valid(shape):
+                print("Skipping shape with invalid geometry in:", filename)
+                continue
             points = shape["points"]
             label = shape["label"]
             group_id = shape.get("group_id")
             shape_type = shape.get("shape_type", "polygon")
-            mask = labelme.utils.shape_to_mask(img.shape[:2], points, shape_type)
+            try:
+                mask, _ = labelme.utils.shapes_to_label(
+                    img.shape[:2], [shape], {label: 1}
+                )
+            except (AssertionError, OverflowError, TypeError, ValueError) as exc:
+                print("Skipping invalid shape in {}: {}".format(filename, exc))
+                continue
+            mask = mask.astype(bool)
+            if not mask.any():
+                print("Skipping out-of-bounds or empty shape in:", filename)
+                continue
 
             if group_id is None:
                 group_id = uuid.uuid1()
@@ -130,25 +226,11 @@ def main():
             else:
                 masks[instance] = mask
 
-            if shape_type == "rectangle":
-                (x1, y1), (x2, y2) = points
-                x1, x2 = sorted([x1, x2])
-                y1, y2 = sorted([y1, y2])
-                points = [x1, y1, x2, y1, x2, y2, x1, y2]
-            if shape_type == "circle":
-                (x1, y1), (x2, y2) = points
-                r = np.linalg.norm([x2 - x1, y2 - y1])
-                # r(1-cos(a/2))<x, a=2*pi/N => N>pi/arccos(1-x/r)
-                # x: tolerance of the gap between the arc and the line segment
-                n_points_circle = max(int(np.pi / np.arccos(1 - 1 / r)), 12)
-                i = np.arange(n_points_circle)
-                x = x1 + r * np.sin(2 * np.pi / n_points_circle * i)
-                y = y1 + r * np.cos(2 * np.pi / n_points_circle * i)
-                points = np.stack((x, y), axis=1).flatten().tolist()
-            else:
+            if shape_type == "polygon" and len(points) >= 3:
                 points = np.asarray(points).flatten().tolist()
-
-            segmentations[instance].append(points)
+                segmentations[instance].append(points)
+            else:
+                requires_rle[instance] = True
         segmentations = dict(segmentations)
 
         for instance, mask in masks.items():
@@ -158,16 +240,32 @@ def main():
             cls_id = class_name_to_id[cls_name]
 
             mask = np.asfortranarray(mask.astype(np.uint8))
-            mask = pycocotools.mask.encode(mask)
-            area = float(pycocotools.mask.area(mask))
-            bbox = pycocotools.mask.toBbox(mask).flatten().tolist()
+            encoded_mask = pycocotools.mask.encode(mask)
+            area = float(pycocotools.mask.area(encoded_mask))
+            bbox = pycocotools.mask.toBbox(encoded_mask).flatten().tolist()
+            if (
+                not mask.any()
+                or not math.isfinite(area)
+                or area <= 0
+                or len(bbox) != 4
+                or not all(math.isfinite(float(value)) for value in bbox)
+                or float(bbox[2]) <= 0
+                or float(bbox[3]) <= 0
+            ):
+                print("Skipping empty or invalid instance in:", filename)
+                continue
+            if requires_rle[instance]:
+                encoded_mask["counts"] = encoded_mask["counts"].decode("ascii")
+                segmentation = encoded_mask
+            else:
+                segmentation = segmentations[instance]
 
             data["annotations"].append(
                 dict(
-                    id=len(data["annotations"]),
+                    id=len(data["annotations"]) + 1,
                     image_id=image_id,
                     category_id=cls_id,
-                    segmentation=segmentations[instance],
+                    segmentation=segmentation,
                     area=area,
                     bbox=bbox,
                     iscrowd=0,
@@ -175,24 +273,27 @@ def main():
             )
 
         if not args.noviz:
-            viz = img
+            viz = labelme.utils.img_arr_to_rgb(img)
             if masks:
-                labels, captions, masks = zip(
-                    *[
-                        (class_name_to_id[cnm], cnm, msk)
-                        for (cnm, gid), msk in masks.items()
-                        if cnm in class_name_to_id
-                    ]
-                )
-                viz = imgviz.instances2rgb(
-                    image=img,
-                    labels=labels,
-                    masks=masks,
-                    captions=captions,
-                    font_size=15,
-                    line_width=2,
-                )
-            out_viz_file = osp.join(args.output_dir, "Visualization", base + ".jpg")
+                known_instances = [
+                    (class_name_to_id[cnm], cnm, msk)
+                    for (cnm, _), msk in masks.items()
+                    if cnm in class_name_to_id
+                ]
+                if known_instances:
+                    labels, captions, known_masks = zip(*known_instances)
+                    viz = imgviz.instances2rgb(
+                        image=viz,
+                        labels=labels,
+                        masks=known_masks,
+                        captions=captions,
+                        font_size=15,
+                        line_width=2,
+                    )
+            out_viz_file = osp.join(
+                args.output_dir, "Visualization", relative_stem + ".jpg"
+            )
+            ensure_parent(out_viz_file)
             imgviz.io.imsave(out_viz_file, viz)
 
     with open(out_ann_file, "w") as f:

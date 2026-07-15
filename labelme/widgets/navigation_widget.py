@@ -44,6 +44,7 @@ class NavigationWidget(QtWidgets.QDialogButtonBox):
     #     self.accept()
 """
 
+
 class NavigationWidget(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super(NavigationWidget, self).__init__(parent)

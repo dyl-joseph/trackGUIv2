@@ -2,11 +2,11 @@ import re
 
 from qtpy import QT_VERSION
 from qtpy import QtCore
-from qtpy import QtGui
 from qtpy import QtWidgets
 
 import labelme.utils
 from labelme.logger import logger
+from labelme.widgets.popup_position import move_to_safe_cursor_position
 
 QT5 = QT_VERSION[0] == "5"
 
@@ -216,20 +216,7 @@ class LabelDialog(QtWidgets.QDialog):
         return group_id
 
     def _moveToSafeCursorPosition(self):
-        self.adjustSize()
-        cursor_pos = QtGui.QCursor.pos() + QtCore.QPoint(16, 16)
-        screen = QtGui.QGuiApplication.screenAt(cursor_pos)
-        if screen is None:
-            screen = QtGui.QGuiApplication.primaryScreen()
-        if screen is None:
-            self.move(cursor_pos)
-            return
-
-        available = screen.availableGeometry()
-        frame = self.frameGeometry()
-        x = min(cursor_pos.x(), available.right() - frame.width() + 1)
-        y = min(cursor_pos.y(), available.bottom() - frame.height() + 1)
-        self.move(max(x, available.left()), max(y, available.top()))
+        move_to_safe_cursor_position(self, self.labelList)
 
     def popUp(self, text=None, move=True, flags=None, group_id=None, description=None):
         if self._fit_to_content["row"]:

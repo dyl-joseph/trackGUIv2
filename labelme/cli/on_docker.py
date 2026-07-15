@@ -3,13 +3,14 @@
 from __future__ import print_function
 
 import argparse
-import distutils.spawn
 import json
 import os
 import os.path as osp
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def get_display_host():
@@ -24,17 +25,22 @@ def get_display_host():
 
 def labelme_on_docker(in_file, out_file):
     display, xhost_target = get_display_host()
-    if xhost_target and distutils.spawn.find_executable("xhost"):
-        subprocess.check_output(["xhost", "+", xhost_target])
-    elif not xhost_target and distutils.spawn.find_executable("xhost"):
-        subprocess.check_output(["xhost", "+local:docker"])
+    xhost_rule = xhost_target if xhost_target else "local:docker"
+    xhost_enabled = bool(shutil.which("xhost"))
 
+    temporary_directory = None
+    temporary_output = None
     if out_file:
         out_file = osp.abspath(out_file)
         if osp.exists(out_file):
             raise RuntimeError("File exists: %s" % out_file)
-        else:
-            open(osp.abspath(out_file), "w").close()
+        output_directory = osp.dirname(out_file)
+        os.makedirs(output_directory, exist_ok=True)
+        temporary_directory = tempfile.mkdtemp(
+            dir=output_directory,
+            prefix=".{}-".format(osp.basename(out_file)),
+        )
+        temporary_output = osp.join(temporary_directory, osp.basename(out_file))
 
     in_file_a = osp.abspath(in_file)
     in_file_b = osp.join("/home/developer", osp.basename(in_file))
@@ -55,22 +61,34 @@ def labelme_on_docker(in_file, out_file):
     if osp.isdir("/tmp/.X11-unix"):
         cmd.extend(["-v", "/tmp/.X11-unix:/tmp/.X11-unix"])
     if out_file:
-        out_file_a = osp.abspath(out_file)
-        out_file_b = osp.join("/home/developer", osp.basename(out_file))
-        cmd.extend(["-v", "{}:{}".format(out_file_a, out_file_b)])
+        output_mount = "/home/developer/labelme-output"
+        out_file_b = osp.join(output_mount, osp.basename(out_file))
+        cmd.extend(["-v", "{}:{}".format(temporary_directory, output_mount)])
     cmd.extend(["wkentaro/labelme", "labelme", in_file_b])
     if out_file:
         cmd.extend(["-O", out_file_b])
-    subprocess.call(cmd)
-
-    if out_file:
-        try:
-            json.load(open(out_file))
+    try:
+        if xhost_enabled:
+            subprocess.run(["xhost", "+{}".format(xhost_rule)], check=True)
+        subprocess.run(cmd, check=True)
+        if out_file:
+            try:
+                with open(temporary_output, encoding="utf-8") as handle:
+                    json.load(handle)
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("Annotation is cancelled or invalid.") from exc
+            os.replace(temporary_output, out_file)
             return out_file
-        except Exception:
-            if open(out_file).read() == "":
-                os.remove(out_file)
-            raise RuntimeError("Annotation is cancelled.")
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError("Docker annotation failed: {}".format(exc)) from exc
+    finally:
+        if xhost_enabled:
+            subprocess.run(
+                ["xhost", "-{}".format(xhost_rule)],
+                check=False,
+            )
+        if temporary_directory:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
 
 
 def main():
@@ -79,7 +97,7 @@ def main():
     parser.add_argument("-O", "--output")
     args = parser.parse_args()
 
-    if not distutils.spawn.find_executable("docker"):
+    if not shutil.which("docker"):
         print("Please install docker", file=sys.stderr)
         sys.exit(1)
 

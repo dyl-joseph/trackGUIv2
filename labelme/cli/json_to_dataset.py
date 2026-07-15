@@ -37,7 +37,8 @@ def main():
     if not osp.exists(out_dir):
         os.mkdir(out_dir)
 
-    data = json.load(open(json_file))
+    with open(json_file, encoding="utf-8") as handle:
+        data = json.load(handle)
     imageData = data.get("imageData")
 
     if not imageData:

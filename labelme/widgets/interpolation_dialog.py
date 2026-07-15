@@ -1,4 +1,15 @@
+from dataclasses import dataclass
+
 from qtpy import QtWidgets
+
+
+@dataclass(frozen=True)
+class InterpolationOptions:
+    start_frame: int
+    end_frame: int
+    interval: int
+    track_id: str
+    label: str
 
 
 class InterpolationDialog(QtWidgets.QDialog):
@@ -7,18 +18,17 @@ class InterpolationDialog(QtWidgets.QDialog):
         self.setModal(True)
         self.setWindowTitle("Interpolation Options")
 
-        self.start_frame = -1
-        self.end_frame = -1
-        self.interval = -1
-        self.ID = -1
-        self.label = -1
-
-        self.start_value = 0
-        self.end_value = 0
-
-        self.start_frame_cell = QtWidgets.QLineEdit()
-        self.end_frame_cell = QtWidgets.QLineEdit()
-        self.interval_cell = QtWidgets.QLineEdit()
+        minimum = max(1, int(min_val))
+        maximum = max(minimum, int(max_val))
+        self.start_frame_cell = QtWidgets.QSpinBox()
+        self.start_frame_cell.setRange(minimum, maximum)
+        self.start_frame_cell.setValue(minimum)
+        self.end_frame_cell = QtWidgets.QSpinBox()
+        self.end_frame_cell.setRange(minimum, maximum)
+        self.end_frame_cell.setValue(maximum)
+        self.interval_cell = QtWidgets.QSpinBox()
+        self.interval_cell.setRange(1, max(1, maximum - minimum))
+        self.interval_cell.setValue(1)
         self.ID_cell = QtWidgets.QLineEdit()
         self.label_cell = QtWidgets.QLineEdit()
 
@@ -47,35 +57,11 @@ class InterpolationDialog(QtWidgets.QDialog):
         row5.addStretch()
         row5.addWidget(self.label_cell)
 
-        # startsliderLayout = QtWidgets.QHBoxLayout()
-        # self.start_slider = QtWidgets.QSlider(Qt.Horizontal)
-        # self.start_slider.setPageStep(1)
-        # self.start_slider.setRange(min_val, max_val)
-        # self.start_slider.setValue(min_val)
-        # self.start_slider.valueChanged.connect(self.onNewValue)
-        # self.start_label = QtWidgets.QLabel(str(min_val), self)
-        # startsliderLayout.addWidget(QtWidgets.QLabel("Start Frame:"))
-        # startsliderLayout.addWidget(self.start_slider)
-        # startsliderLayout.addWidget(self.start_label)
-
-        # endsliderLayout = QtWidgets.QHBoxLayout()
-        # self.end_slider = QtWidgets.QSlider(Qt.Horizontal)
-        # self.end_slider.setPageStep(1)
-        # self.end_slider.setRange(min_val, max_val)
-        # self.end_slider.setValue(max_val)
-        # self.end_slider.valueChanged.connect(self.onNewValue)
-        # self.end_label = QtWidgets.QLabel(str(max_val), self)
-        # endsliderLayout.addWidget(QtWidgets.QLabel("End Frame:"))
-        # endsliderLayout.addWidget(self.end_slider)
-        # endsliderLayout.addWidget(self.end_label)
-
-
-        # self.formLayout = QtWidgets.QFormLayout()
-        # self.formLayout.addRow(self.tr("Start Frame:"), self.slider_start_frame)
-        # self.formLayout.addRow(self.tr("End Frame:"), self.slider_end_frame)
-
-        self.button = QtWidgets.QPushButton("Finish")
-        self.button.clicked.connect(self.get_info)
+        self.button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
 
         layout = QtWidgets.QVBoxLayout()
         layout.addLayout(row1)
@@ -83,28 +69,18 @@ class InterpolationDialog(QtWidgets.QDialog):
         layout.addLayout(row3)
         layout.addLayout(row4)
         layout.addLayout(row5)
-        # layout.addLayout(startsliderLayout,stretch=3)
-        # layout.addLayout(endsliderLayout,stretch=3)
-        layout.addWidget(self.button)
+        layout.addWidget(self.button_box)
         self.setLayout(layout)
 
-    def get_info(self):
-        self.start_frame = self.start_frame_cell.text()
-        self.end_frame = self.end_frame_cell.text()
-        self.interval = self.interval_cell.text()
-        self.ID = self.interval_cell.text()
-        self.label = self.label_cell.text()
-
-        self.accept()
-    
-    # def onNewValue(self):
-    #     start_value = self.start_slider.value() 
-    #     end_value = self.end_slider.value()
-    #     self.start_label.setText(str(start_value))
-    #     self.end_label.setText(str(end_value))
-
-
-
-
-
-
+    def options(self):
+        track_id = self.ID_cell.text().strip()
+        label = self.label_cell.text().strip()
+        if not track_id or not label:
+            raise ValueError("Object label and ID are required.")
+        return InterpolationOptions(
+            start_frame=self.start_frame_cell.value(),
+            end_frame=self.end_frame_cell.value(),
+            interval=self.interval_cell.value(),
+            track_id=track_id,
+            label=label,
+        )

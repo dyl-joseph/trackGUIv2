@@ -2,6 +2,7 @@ import os.path as osp
 
 import numpy as np
 import PIL.Image
+from qtpy import QtGui
 
 from labelme.utils import image as image_module
 
@@ -29,3 +30,32 @@ def test_img_data_to_png_data():
         img_data = f.read()
     png_data = image_module.img_data_to_png_data(img_data)
     assert isinstance(png_data, bytes)
+
+
+def test_img_qt_to_arr_respects_rgb_row_padding():
+    padded_rows = bytes([255, 0, 0, 0, 0, 0, 255, 0])
+    image = QtGui.QImage(padded_rows, 1, 2, 4, QtGui.QImage.Format_RGB888)
+
+    array = image_module.img_qt_to_arr(image)
+
+    np.testing.assert_array_equal(
+        array,
+        np.array([[[255, 0, 0]], [[0, 0, 255]]], dtype=np.uint8),
+    )
+
+
+def test_image_array_helpers_support_grayscale_and_rgba():
+    grayscale = np.array([[1, 2], [3, 4]], dtype=np.uint8)
+    rgba = np.zeros((2, 2, 4), dtype=np.uint8)
+    rgba[:, :, :3] = 7
+
+    assert image_module.img_arr_channel_count(grayscale) == 1
+    assert image_module.img_arr_channel_count(rgba) == 4
+    np.testing.assert_array_equal(
+        image_module.img_arr_to_rgb(grayscale),
+        np.repeat(grayscale[:, :, None], 3, axis=2),
+    )
+    np.testing.assert_array_equal(
+        image_module.img_arr_to_rgb(rgba),
+        np.full((2, 2, 3), 7, dtype=np.uint8),
+    )

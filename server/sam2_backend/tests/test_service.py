@@ -1,5 +1,7 @@
 import hashlib
 import io
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -56,7 +58,7 @@ def test_point_prompt_returns_bbox_from_best_mask():
         label=1,
     )
 
-    assert response["bbox"] == [3.0, 2.0, 6.0, 4.0]
+    assert response["bbox"] == [3.0, 2.0, 7.0, 5.0]
     assert response["score"] == 0.75
     assert response["model"] == "sam2.1"
 
@@ -78,3 +80,123 @@ def test_mask_to_bbox_rejects_empty_mask():
 
     assert exc_info.value.status_code == 422
     assert exc_info.value.detail == "SAM2 returned an empty mask."
+
+
+def test_register_image_enforces_upload_and_decoded_pixel_limits():
+    upload_limited = Sam2Service(
+        predictor=FakePredictor(np.zeros((1, 1), dtype=bool)),
+        max_upload_bytes=2,
+    )
+    with pytest.raises(Sam2ServiceError) as upload_error:
+        upload_limited.register_image(b"123")
+    assert upload_error.value.status_code == 413
+
+    pixel_limited = Sam2Service(
+        predictor=FakePredictor(np.zeros((3, 3), dtype=bool)),
+        max_pixels=8,
+    )
+    with pytest.raises(Sam2ServiceError) as pixel_error:
+        pixel_limited.register_image(_image_bytes(width=3, height=3))
+    assert pixel_error.value.status_code == 413
+
+
+def test_image_cache_evicts_least_recently_used_frame():
+    service = Sam2Service(
+        predictor=FakePredictor(np.zeros((6, 8), dtype=bool)),
+        max_cached_images=2,
+    )
+    first = service.register_image(_image_bytes(width=8, height=6))
+    second = service.register_image(_image_bytes(width=9, height=6))
+    service.register_image(_image_bytes(width=10, height=6))
+
+    with pytest.raises(Sam2ServiceError, match="Unknown image_id") as exc_info:
+        service.point_prompt(first["image_id"], 1, 1)
+
+    assert exc_info.value.status_code == 404
+    assert second["image_id"] in service._images
+
+
+@pytest.mark.parametrize(
+    "masks,scores,detail",
+    [
+        (np.empty((0, 3, 3)), np.empty(0), "invalid shape"),
+        (np.zeros((1, 3, 3)), np.empty(0), "counts do not match"),
+        (np.zeros((2, 3, 3)), np.array([0.5]), "counts do not match"),
+        (np.zeros((1, 3, 3)), np.array([np.nan]), "non-finite"),
+        (np.array([[["bad"]]]), np.array([0.5]), "non-numeric"),
+    ],
+)
+def test_select_mask_rejects_malformed_model_outputs(masks, scores, detail):
+    service = Sam2Service(predictor=FakePredictor(np.zeros((3, 3))))
+
+    with pytest.raises(Sam2ServiceError, match=detail):
+        service._select_mask(masks, scores)
+
+
+def test_readiness_distinguishes_loaded_predictor_from_missing_configuration():
+    ready = Sam2Service(predictor=FakePredictor(np.zeros((2, 2), dtype=bool)))
+    not_ready = Sam2Service()
+
+    assert ready.readiness()["ready"] is True
+    assert not_ready.health()["status"] == "ok"
+    assert not_ready.readiness()["ready"] is False
+
+
+def test_readiness_surfaces_predictor_initialization_failure(monkeypatch):
+    service = Sam2Service()
+
+    def fail_to_initialize():
+        raise Sam2ServiceError(503, "checkpoint is incompatible")
+
+    monkeypatch.setattr(service, "_ensure_predictor", fail_to_initialize)
+
+    readiness = service.readiness()
+
+    assert readiness["ready"] is False
+    assert readiness["detail"] == "checkpoint is incompatible"
+
+
+def test_predictor_accepts_installed_package_hydra_config_name(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    calls = []
+
+    def build_sam2(model_cfg, checkpoint_path, device):
+        calls.append((model_cfg, checkpoint_path, device))
+        return object()
+
+    class FakeImagePredictor:
+        def __init__(self, model):
+            self.model = model
+
+    sam2_package = types.ModuleType("sam2")
+    sam2_package.__path__ = []
+    build_module = types.ModuleType("sam2.build_sam")
+    build_module.build_sam2 = build_sam2
+    predictor_module = types.ModuleType("sam2.sam2_image_predictor")
+    predictor_module.SAM2ImagePredictor = FakeImagePredictor
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    monkeypatch.setitem(sys.modules, "sam2", sam2_package)
+    monkeypatch.setitem(sys.modules, "sam2.build_sam", build_module)
+    monkeypatch.setitem(sys.modules, "sam2.sam2_image_predictor", predictor_module)
+    config_name = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    service = Sam2Service(
+        model_cfg=config_name,
+        checkpoint=str(checkpoint),
+        device="cpu",
+    )
+
+    service._ensure_predictor()
+
+    assert calls == [(config_name, str(checkpoint), "cpu")]
+    assert isinstance(service._predictor, FakeImagePredictor)
+
+
+def test_point_prompt_rejects_boolean_label_and_invalid_image_id():
+    service = Sam2Service(predictor=FakePredictor(np.ones((6, 8), dtype=bool)))
+    registered = service.register_image(_image_bytes(width=8, height=6))
+
+    with pytest.raises(Sam2ServiceError, match="label"):
+        service.point_prompt(registered["image_id"], 1, 1, label=True)
+    with pytest.raises(Sam2ServiceError, match="image_id"):
+        service.point_prompt([], 1, 1)

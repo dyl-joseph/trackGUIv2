@@ -7,8 +7,9 @@ class DeletionDialog(QtWidgets.QDialog):
         self.setModal(True)
         self.setWindowTitle("Modification Options")
 
-        self.start_frame_cell = QtWidgets.QLineEdit()
-        self.end_frame_cell = QtWidgets.QLineEdit()
+        self.start_frame_cell = QtWidgets.QSpinBox()
+        self.end_frame_cell = QtWidgets.QSpinBox()
+        self.setFrameRange(1, 1, 1)
         self.ID_cell = QtWidgets.QLineEdit()
         self.label_cell = QtWidgets.QLineEdit()
         self.new_ID_cell = QtWidgets.QLineEdit()
@@ -34,6 +35,15 @@ class DeletionDialog(QtWidgets.QDialog):
         layout.addRow("Mode:", self.mode_combo)
         layout.addWidget(self.button_box)
         self.setLayout(layout)
+
+    def setFrameRange(self, minimum, maximum, current):
+        minimum = max(1, int(minimum))
+        maximum = max(minimum, int(maximum))
+        current = min(max(int(current), minimum), maximum)
+        for widget in (self.start_frame_cell, self.end_frame_cell):
+            widget.setRange(minimum, maximum)
+        self.start_frame_cell.setValue(current)
+        self.end_frame_cell.setValue(maximum)
 
     @property
     def mode(self):

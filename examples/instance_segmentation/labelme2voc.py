@@ -14,6 +14,62 @@ import numpy as np
 import labelme
 
 
+def find_label_files(input_dir):
+    pattern = osp.join(osp.abspath(input_dir), "**", "*.json")
+    files = glob.glob(pattern, recursive=True)
+    return sorted(
+        filename
+        for filename in files
+        if not any(
+            part.startswith(".")
+            for part in osp.relpath(filename, input_dir).replace("\\", "/").split("/")
+        )
+    )
+
+
+def relative_output_stem(filename, input_dir):
+    relative = osp.relpath(osp.abspath(filename), osp.abspath(input_dir))
+    return osp.splitext(relative)[0]
+
+
+def ensure_parent(filename):
+    os.makedirs(osp.dirname(filename), exist_ok=True)
+
+
+def valid_shapes_for_image(shapes, img_shape, label_name_to_value, filename):
+    valid_shapes = []
+    for shape in shapes:
+        label = shape.get("label")
+        if label not in label_name_to_value:
+            print("Skipping unknown label {!r} in: {}".format(label, filename))
+            continue
+        try:
+            points = np.asarray(shape.get("points", []), dtype=float)
+        except (TypeError, ValueError):
+            points = np.empty(0)
+        if (
+            points.ndim != 2
+            or points.shape[1:] != (2,)
+            or not np.isfinite(points).all()
+        ):
+            print("Skipping shape with invalid coordinates in:", filename)
+            continue
+        try:
+            _, probe_instances = labelme.utils.shapes_to_label(
+                img_shape=img_shape,
+                shapes=[shape],
+                label_name_to_value={label: 1},
+            )
+        except (AssertionError, OverflowError, TypeError, ValueError) as exc:
+            print("Skipping invalid shape in {}: {}".format(filename, exc))
+            continue
+        if not probe_instances.any():
+            print("Skipping out-of-bounds or empty shape in:", filename)
+            continue
+        valid_shapes.append(shape)
+    return valid_shapes
+
+
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -77,45 +133,69 @@ def main():
         f.writelines("\n".join(class_names))
     print("Saved class_names:", out_class_names_file)
 
-    for filename in sorted(glob.glob(osp.join(args.input_dir, "*.json"))):
+    for filename in find_label_files(args.input_dir):
         print("Generating dataset from:", filename)
 
         label_file = labelme.LabelFile(filename=filename)
 
-        base = osp.splitext(osp.basename(filename))[0]
-        out_img_file = osp.join(args.output_dir, "JPEGImages", base + ".jpg")
-        out_clsp_file = osp.join(args.output_dir, "SegmentationClass", base + ".png")
+        relative_stem = relative_output_stem(filename, args.input_dir)
+        out_img_file = osp.join(args.output_dir, "JPEGImages", relative_stem + ".jpg")
+        out_clsp_file = osp.join(
+            args.output_dir, "SegmentationClass", relative_stem + ".png"
+        )
         if not args.nonpy:
             out_cls_file = osp.join(
-                args.output_dir, "SegmentationClassNpy", base + ".npy"
+                args.output_dir, "SegmentationClassNpy", relative_stem + ".npy"
             )
         if not args.noviz:
             out_clsv_file = osp.join(
                 args.output_dir,
                 "SegmentationClassVisualization",
-                base + ".jpg",
+                relative_stem + ".jpg",
             )
         if not args.noobject:
             out_insp_file = osp.join(
-                args.output_dir, "SegmentationObject", base + ".png"
+                args.output_dir, "SegmentationObject", relative_stem + ".png"
             )
             if not args.nonpy:
                 out_ins_file = osp.join(
-                    args.output_dir, "SegmentationObjectNpy", base + ".npy"
+                    args.output_dir,
+                    "SegmentationObjectNpy",
+                    relative_stem + ".npy",
                 )
             if not args.noviz:
                 out_insv_file = osp.join(
                     args.output_dir,
                     "SegmentationObjectVisualization",
-                    base + ".jpg",
+                    relative_stem + ".jpg",
                 )
+
+        output_files = [out_img_file, out_clsp_file]
+        if not args.nonpy:
+            output_files.append(out_cls_file)
+        if not args.noviz:
+            output_files.append(out_clsv_file)
+        if not args.noobject:
+            output_files.append(out_insp_file)
+            if not args.nonpy:
+                output_files.append(out_ins_file)
+            if not args.noviz:
+                output_files.append(out_insv_file)
+        for output_file in output_files:
+            ensure_parent(output_file)
 
         img = labelme.utils.img_data_to_arr(label_file.imageData)
         imgviz.io.imsave(out_img_file, img)
 
+        shapes = valid_shapes_for_image(
+            label_file.shapes,
+            img.shape,
+            class_name_to_id,
+            filename,
+        )
         cls, ins = labelme.utils.shapes_to_label(
             img_shape=img.shape,
-            shapes=label_file.shapes,
+            shapes=shapes,
             label_name_to_value=class_name_to_id,
         )
         ins[cls == -1] = 0  # ignore it.
@@ -127,7 +207,7 @@ def main():
         if not args.noviz:
             clsv = imgviz.label2rgb(
                 cls,
-                imgviz.rgb2gray(img),
+                imgviz.asgray(img),
                 label_names=class_names,
                 font_size=15,
                 loc="rb",
@@ -144,7 +224,7 @@ def main():
                 instance_names = [str(i) for i in range(max(instance_ids) + 1)]
                 insv = imgviz.label2rgb(
                     ins,
-                    imgviz.rgb2gray(img),
+                    imgviz.asgray(img),
                     label_names=instance_names,
                     font_size=15,
                     loc="rb",

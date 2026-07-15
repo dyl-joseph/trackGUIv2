@@ -92,17 +92,13 @@ class LabelListWidgetItem(QtGui.QStandardItem):
 
 
 class StandardItemModel(QtGui.QStandardItemModel):
-    itemDropped = QtCore.Signal()
-
-    def removeRows(self, *args, **kwargs):
-        ret = super().removeRows(*args, **kwargs)
-        self.itemDropped.emit()
-        return ret
+    pass
 
 
 class LabelListWidget(QtWidgets.QListView):
     itemDoubleClicked = QtCore.Signal(LabelListWidgetItem)
     itemSelectionChanged = QtCore.Signal(list, list)
+    itemDropped = QtCore.Signal()
 
     def __init__(self):
         super(LabelListWidget, self).__init__()
@@ -131,12 +127,25 @@ class LabelListWidget(QtWidgets.QListView):
             yield self[i]
 
     @property
-    def itemDropped(self):
-        return self.model().itemDropped
-
-    @property
     def itemChanged(self):
         return self.model().itemChanged
+
+    def dropEvent(self, event):
+        before = tuple(id(item.shape()) for item in self)
+        super().dropEvent(event)
+        if event.isAccepted():
+            self._scheduleItemDropped(before)
+
+    def _scheduleItemDropped(self, before):
+        # With InternalMove, Qt inserts the target clone during dropEvent but
+        # removes the source row only after dropEvent returns. Inspect the final
+        # model on the next event-loop turn.
+        QtCore.QTimer.singleShot(0, lambda: self._emitItemDroppedIfChanged(before))
+
+    def _emitItemDroppedIfChanged(self, before):
+        after = tuple(id(item.shape()) for item in self)
+        if after != before:
+            self.itemDropped.emit()
 
     def itemSelectionChangedEvent(self, selected, deselected):
         selected = [self.model().itemFromIndex(i) for i in selected.indexes()]
@@ -175,10 +184,25 @@ class LabelListWidget(QtWidgets.QListView):
     def findItemByShape(self, shape):
         item = self._shape_to_item.get(id(shape))
         if item is not None:
-            return item
+            try:
+                index = self.model().indexFromItem(item)
+                if (
+                    index.isValid()
+                    and self.model().itemFromIndex(index) is item
+                    and item.shape() is shape
+                ):
+                    return item
+            except RuntimeError:
+                # Some Qt bindings delete the wrapped C++ item as soon as the
+                # source row of an internal move is removed.
+                pass
+            # Qt implements internal moves by cloning the item and detaching the
+            # original, so cached items must never be trusted without checking
+            # that they still belong to this model.
+            self._shape_to_item.pop(id(shape), None)
         for row in range(self.model().rowCount()):
             item = self.model().item(row, 0)
-            if item.shape() == shape:
+            if item.shape() is shape:
                 self._shape_to_item[id(shape)] = item
                 return item
         raise ValueError("cannot find shape: {}".format(shape))
