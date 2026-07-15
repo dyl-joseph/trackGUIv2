@@ -3,6 +3,7 @@ import os.path as osp
 import shutil
 import tempfile
 
+import numpy as np
 import pytest
 from qtpy import QtCore
 from qtpy import QtGui
@@ -740,6 +741,47 @@ def test_hosted_sam2_reregisters_once_after_backend_cache_loss(qtbot):
     assert len(client.register_calls) == 2
     assert [call[0] for call in client.prompt_calls] == ["image-1", "image-2"]
     win.setClean()
+
+
+@pytest.mark.gui
+def test_hosted_sam2_does_not_reregister_a_stale_frame(qtbot):
+    config = labelme.config.get_default_config()
+    config["hosted_sam2"]["url"] = "http://sam2.example"
+    win = labelme.app.MainWindow(config=config)
+    qtbot.addWidget(win)
+    client = FakeHostedSam2Client()
+    win._hosted_sam2_client = client
+    win.image = QtGui.QImage(2, 2, QtGui.QImage.Format_RGB32)
+    win.imageData = b"current-frame"
+    win.imagePath = "/frames/current.png"
+    stale_key = "stale-frame-key"
+    win._hosted_sam2_image_cache[stale_key] = {"image_id": "stale"}
+    win._hosted_sam2_request_context = {
+        "kind": "point_prompt",
+        "frame_key": stale_key,
+        "point": (1.0, 1.0),
+        "retry_count": 0,
+        "image_data": b"stale-frame",
+    }
+
+    win._hostedSam2RequestFailed(HostedSam2Error("Unknown image_id.", status_code=404))
+
+    assert client.register_calls == []
+    assert stale_key not in win._hosted_sam2_image_cache
+
+
+@pytest.mark.gui
+def test_hosted_sam2_client_cache_is_access_ordered(qtbot):
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    win._hosted_sam2_max_cached_frames = 2
+    win._rememberHostedSam2Image("a", {"image_id": "a"})
+    win._rememberHostedSam2Image("b", {"image_id": "b"})
+
+    assert win._hostedSam2CachedImage("a") == {"image_id": "a"}
+    win._rememberHostedSam2Image("c", {"image_id": "c"})
+
+    assert list(win._hosted_sam2_image_cache) == ["a", "c"]
 
 
 def test_load_image_file_returns_raw_jpeg_when_no_orientation():
@@ -1536,3 +1578,463 @@ def test_fresh_window_adds_both_annotation_docks(qtbot):
 
     assert win.dockWidgetArea(win.shape_dock) != QtCore.Qt.NoDockWidgetArea
     assert win.dockWidgetArea(win.id_dock) != QtCore.Qt.NoDockWidgetArea
+
+
+@pytest.mark.gui
+def test_save_as_becomes_authoritative_for_later_saves(qtbot, tmp_path, monkeypatch):
+    image_file = tmp_path / "frame.jpg"
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    chosen_label_file = tmp_path / "chosen-name.json"
+    canonical_label_file = tmp_path / "frame.json"
+    config = labelme.config.get_default_config()
+    config["auto_save"] = False
+    win = labelme.app.MainWindow(config=config, filename=str(image_file))
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    monkeypatch.setattr(win, "saveFileDialog", lambda: str(chosen_label_file))
+
+    assert win.saveFileAs()
+    assert win.getLabelFile() == str(chosen_label_file)
+    assert win.hasLabelFile()
+    assert win.saveFile()
+    assert chosen_label_file.is_file()
+    assert not canonical_label_file.exists()
+    assert win.loadFile(str(image_file))
+    assert win.getLabelFile() == str(chosen_label_file)
+
+
+@pytest.mark.gui
+def test_normal_save_preserves_existing_embedded_image_data(qtbot, tmp_path):
+    source_image = osp.join(data_dir, "raw/2011_000003.jpg")
+    with open(source_image, "rb") as handle:
+        image_data = handle.read()
+    label_file = tmp_path / "self-contained.json"
+    LabelFile().save(
+        filename=str(label_file),
+        shapes=[],
+        imagePath="missing-image.jpg",
+        imageData=image_data,
+        imageHeight=375,
+        imageWidth=500,
+        flags={},
+    )
+    config = labelme.config.get_default_config()
+    config["auto_save"] = False
+    config["store_data"] = False
+    win = labelme.app.MainWindow(config=config, filename=str(label_file))
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+
+    assert win.labelFile.imageDataEmbedded
+    assert win.saveFile()
+    assert _read_json(label_file)["imageData"] is not None
+
+
+def _save_output_dir_annotation(path, image_path, label):
+    LabelFile().save(
+        filename=str(path),
+        shapes=[
+            {
+                "label": label,
+                "points": [[10, 10], [20, 20]],
+                "group_id": 1,
+                "track_id": 1,
+                "shape_type": "rectangle",
+                "flags": {},
+                "description": "",
+                "mask": None,
+            }
+        ],
+        imagePath=osp.relpath(image_path, path.parent),
+        imageData=None,
+        imageHeight=375,
+        imageWidth=500,
+        flags={},
+    )
+
+
+@pytest.mark.gui
+def test_changing_output_dir_loads_the_new_directory_annotation(
+    qtbot, tmp_path, monkeypatch
+):
+    image_dir = tmp_path / "images"
+    old_output = tmp_path / "old-labels"
+    new_output = tmp_path / "new-labels"
+    image_dir.mkdir()
+    old_output.mkdir()
+    new_output.mkdir()
+    image_file = image_dir / "frame.jpg"
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    _save_output_dir_annotation(old_output / "frame.json", image_file, "old")
+    _save_output_dir_annotation(new_output / "frame.json", image_file, "new")
+    config = labelme.config.get_default_config()
+    config["auto_save"] = False
+    win = labelme.app.MainWindow(
+        config=config,
+        filename=str(image_dir),
+        output_dir=str(old_output),
+    )
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    assert win.canvas.shapes[0].label == "old"
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getExistingDirectory",
+        lambda *_args, **_kwargs: str(new_output),
+    )
+
+    win.changeOutputDirDialog()
+
+    assert win.output_dir == str(new_output)
+    assert win.canvas.shapes[0].label == "new"
+    assert win.labelFile.filename == str(new_output / "frame.json")
+
+
+@pytest.mark.gui
+def test_changing_output_dir_rolls_back_when_new_annotation_is_invalid(
+    qtbot, tmp_path, monkeypatch
+):
+    image_dir = tmp_path / "images"
+    old_output = tmp_path / "old-labels"
+    bad_output = tmp_path / "bad-labels"
+    image_dir.mkdir()
+    old_output.mkdir()
+    bad_output.mkdir()
+    image_file = image_dir / "frame.jpg"
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    _save_output_dir_annotation(old_output / "frame.json", image_file, "old")
+    (bad_output / "frame.json").write_text("{bad json", encoding="utf-8")
+    config = labelme.config.get_default_config()
+    config["auto_save"] = False
+    win = labelme.app.MainWindow(
+        config=config,
+        filename=str(image_dir),
+        output_dir=str(old_output),
+    )
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    errors = []
+    win.errorMessage = lambda title, message: errors.append((title, message))
+    monkeypatch.setattr(
+        QtWidgets.QFileDialog,
+        "getExistingDirectory",
+        lambda *_args, **_kwargs: str(bad_output),
+    )
+
+    win.changeOutputDirDialog()
+
+    assert errors
+    assert win.output_dir == str(old_output)
+    assert win.canvas.shapes[0].label == "old"
+    assert win.labelFile.filename == str(old_output / "frame.json")
+
+
+@pytest.mark.gui
+def test_canonical_save_retires_legacy_flat_annotation(qtbot, tmp_path):
+    image_root = tmp_path / "images"
+    image_file = image_root / "camera1" / "frame.jpg"
+    output = tmp_path / "annotations"
+    image_file.parent.mkdir(parents=True)
+    output.mkdir()
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    legacy = output / "frame.json"
+    canonical = output / "camera1" / "frame.json"
+    _save_output_dir_annotation(legacy, image_file, "legacy")
+    config = labelme.config.get_default_config()
+    config["auto_save"] = False
+    win = labelme.app.MainWindow(
+        config=config,
+        filename=str(image_root),
+        output_dir=str(output),
+    )
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+
+    assert win.canvas.shapes[0].label == "legacy"
+    assert win.saveFile()
+    assert canonical.is_file()
+    assert not legacy.exists()
+
+    _save_output_dir_annotation(legacy, image_file, "stale")
+    assert win.saveFile()
+    assert not legacy.exists()
+
+    canonical.unlink()
+    assert win.loadFile(str(image_file))
+    assert win.canvas.shapes == []
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize(
+    "shape_override",
+    [
+        {"shape_type": "unsupported"},
+        {"points": [["bad", 1], [2, 3]]},
+        {"flags": None},
+    ],
+)
+def test_bad_shape_data_does_not_destroy_displayed_frame(
+    qtbot, tmp_path, shape_override
+):
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    source = osp.join(data_dir, "raw/2011_000003.jpg")
+    shutil.copy(source, first)
+    shutil.copy(source, second)
+    shape = {
+        "label": "person",
+        "points": [[1, 1], [5, 5]],
+        "group_id": 1,
+        "track_id": 1,
+        "shape_type": "rectangle",
+        "flags": {},
+        "description": "",
+        "mask": None,
+    }
+    shape.update(shape_override)
+    (tmp_path / "second.json").write_text(
+        json.dumps(
+            {
+                "version": "test",
+                "flags": {},
+                "shapes": [shape],
+                "imagePath": second.name,
+                "imageData": None,
+                "imageHeight": 375,
+                "imageWidth": 500,
+            }
+        ),
+        encoding="utf-8",
+    )
+    win = labelme.app.MainWindow(
+        config=labelme.config.get_default_config(), filename=str(first)
+    )
+    qtbot.addWidget(win)
+    _win_show_and_wait_imageData(qtbot, win)
+    original_data = win.imageData
+    errors = []
+    win.errorMessage = lambda title, message: errors.append((title, message))
+
+    assert not win.loadFile(str(second))
+
+    assert win.filename == str(first)
+    assert win.imageData == original_data
+    assert errors
+
+
+@pytest.mark.gui
+def test_forward_tracking_rejects_matching_polygon_without_mutating_file(
+    qtbot, tmp_path
+):
+    image_file = tmp_path / "frame.jpg"
+    shutil.copy(osp.join(data_dir, "raw/2011_000003.jpg"), image_file)
+    label_file = tmp_path / "frame.json"
+    polygon = {
+        "label": "person",
+        "points": [[1, 1], [5, 1], [5, 5]],
+        "group_id": 1,
+        "track_id": 1,
+        "shape_type": "polygon",
+        "flags": {},
+        "description": "",
+        "mask": None,
+    }
+    LabelFile().save(
+        filename=str(label_file),
+        shapes=[polygon],
+        imagePath=image_file.name,
+        imageData=None,
+        imageHeight=375,
+        imageWidth=500,
+        flags={},
+    )
+    before = label_file.read_bytes()
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    win.lastOpenDir = str(tmp_path)
+    win._imageListCache = [str(image_file)]
+
+    with pytest.raises(ValueError, match="non-rectangle"):
+        win._trackResultRequest(
+            str(image_file), "person", 1, 1, [[2, 2], [6, 6]], (375, 500)
+        )
+
+    assert label_file.read_bytes() == before
+
+
+@pytest.mark.gui
+def test_interpolation_mode_is_not_committed_when_first_frame_fails_to_load(
+    qtbot, monkeypatch
+):
+    class AcceptedInterpolationDialog:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+        def options(self):
+            return type(
+                "Options",
+                (),
+                {
+                    "start_frame": 1,
+                    "end_frame": 2,
+                    "interval": 1,
+                    "track_id": "1",
+                    "label": "person",
+                },
+            )()
+
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    win._imageListCache = ["/frames/1.jpg", "/frames/2.jpg"]
+    win.filename = "/frames/1.jpg"
+    win.mode = "NORMAL"
+    monkeypatch.setattr(labelme.app, "InterpolationDialog", AcceptedInterpolationDialog)
+    monkeypatch.setattr(win, "_ensureSavedForWorkflow", lambda _title: True)
+    monkeypatch.setattr(win, "loadFile", lambda _filename: False)
+
+    win.INTERPOLATION()
+
+    assert win.mode == "NORMAL"
+    assert win.INTERPOLATION_list == []
+    assert win.INTERPOLATION_indices == []
+
+
+def _rectangle(label="person", track_id=1, x1=1, y1=1, x2=5, y2=5):
+    shape = Shape(
+        label=label,
+        group_id=track_id,
+        track_id=track_id,
+        shape_type="rectangle",
+        flags={},
+    )
+    shape.points = [QtCore.QPointF(x1, y1), QtCore.QPointF(x2, y2)]
+    shape.point_labels = [1, 1]
+    return shape
+
+
+@pytest.mark.gui
+def test_label_and_id_edits_create_undo_snapshots(qtbot):
+    class EditLabelDialog:
+        def popUp(self, **_kwargs):
+            return "vehicle", {}, 1, ""
+
+        def addLabelHistory(self, _label):
+            pass
+
+    class EditIDDialog:
+        def popUp(self, **_kwargs):
+            return "2"
+
+        def addIDHistory(self, _track_id):
+            pass
+
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    win.loadShapes([_rectangle()])
+    win.labelDialog = EditLabelDialog()
+    win.editLabel(next(iter(win.labelList)))
+    assert win.canvas.shapes[0].label == "vehicle"
+    win.undoShapeEdit()
+    assert win.canvas.shapes[0].label == "person"
+
+    win.IDDialog = EditIDDialog()
+    win.editID(next(iter(win.IDList)))
+    assert win.canvas.shapes[0].track_id == "2"
+    win.undoShapeEdit()
+    assert win.canvas.shapes[0].track_id == 1
+    win.setClean()
+
+
+@pytest.mark.gui
+def test_multi_shape_ai_refinement_creates_one_undo_snapshot(qtbot, monkeypatch):
+    class FakeModel:
+        def predict_mask_from_box(self, _box):
+            mask = np.zeros((12, 12), dtype=bool)
+            mask[3:8, 4:9] = True
+            return mask
+
+    first = _rectangle(track_id=1, x1=1, y1=1, x2=5, y2=5)
+    second = _rectangle(track_id=2, x1=2, y1=2, x2=6, y2=6)
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    win.loadShapes([first, second])
+    win.canvas.selectedShapes = [first, second]
+
+    def initialize(_name):
+        win.canvas._ai_model = FakeModel()
+
+    monkeypatch.setattr(win.canvas, "initializeAiModel", initialize)
+
+    win.refineBboxAI()
+
+    assert len(win.canvas.shapesBackups) == 2
+    assert win.canvas.shapes[0].points[0] == QtCore.QPointF(4, 3)
+    assert win.canvas.shapes[1].points[0] == QtCore.QPointF(4, 3)
+    win.undoShapeEdit()
+    assert win.canvas.shapes[0].points[0] == QtCore.QPointF(1, 1)
+    assert win.canvas.shapes[1].points[0] == QtCore.QPointF(2, 2)
+    win.setClean()
+
+
+@pytest.mark.gui
+def test_multi_shape_ai_refinement_rolls_back_inference_failure(qtbot, monkeypatch):
+    class FailingModel:
+        def __init__(self):
+            self.calls = 0
+
+        def predict_mask_from_box(self, _box):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("inference failed")
+            return np.ones((12, 12), dtype=bool)
+
+    first = _rectangle(track_id=1, x1=1, y1=1, x2=5, y2=5)
+    second = _rectangle(track_id=2, x1=2, y1=2, x2=6, y2=6)
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    win.loadShapes([first, second])
+    win.canvas.selectedShapes = [first, second]
+    monkeypatch.setattr(
+        win.canvas,
+        "initializeAiModel",
+        lambda _name: setattr(win.canvas, "_ai_model", FailingModel()),
+    )
+    errors = []
+    win.errorMessage = lambda title, message: errors.append((title, message))
+
+    win.refineBboxAI()
+
+    assert errors == [("Refine Bbox (AI)", "inference failed")]
+    assert len(win.canvas.shapesBackups) == 1
+    assert win.canvas.shapes[0].points[0] == QtCore.QPointF(1, 1)
+    assert win.canvas.shapes[1].points[0] == QtCore.QPointF(2, 2)
+
+
+@pytest.mark.gui
+def test_cancelled_deferred_close_does_not_poison_future_workers(qtbot, monkeypatch):
+    class Event:
+        accepted = False
+        ignored = False
+
+        def accept(self):
+            self.accepted = True
+
+        def ignore(self):
+            self.ignored = True
+
+    win = labelme.app.MainWindow(config=labelme.config.get_default_config())
+    qtbot.addWidget(win)
+    win._close_after_tracking = True
+    win._close_after_hosted_request = True
+    monkeypatch.setattr(win, "mayContinue", lambda: False)
+    event = Event()
+
+    win.closeEvent(event)
+
+    assert event.ignored
+    assert not event.accepted
+    assert not win._close_after_tracking
+    assert not win._close_after_hosted_request

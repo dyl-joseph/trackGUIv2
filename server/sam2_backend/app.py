@@ -9,7 +9,7 @@ from fastapi import Header
 from fastapi import HTTPException
 from fastapi import UploadFile
 from pydantic import BaseModel
-from pydantic import validator
+from pydantic import field_validator
 
 from .auth import bearer_token_is_valid
 from .service import Sam2Service
@@ -26,13 +26,13 @@ class PointPromptRequest(BaseModel):
     y: float
     label: int = 1
 
-    @validator("image_id", pre=True)
+    @field_validator("image_id", mode="before")
     def validate_image_id(cls, value):
         if not isinstance(value, str) or not value.strip():
             raise ValueError("image_id must be a non-empty string")
         return value
 
-    @validator("x", "y", pre=True)
+    @field_validator("x", "y", mode="before")
     def validate_coordinate(cls, value):
         if (
             isinstance(value, bool)
@@ -42,7 +42,7 @@ class PointPromptRequest(BaseModel):
             raise ValueError("point coordinates must be finite numbers")
         return value
 
-    @validator("label", pre=True)
+    @field_validator("label", mode="before")
     def validate_label(cls, value):
         if isinstance(value, bool) or value not in (0, 1):
             raise ValueError("point label must be 0 or 1")

@@ -50,7 +50,7 @@ class Canvas(QtWidgets.QWidget):
             raise ValueError(
                 "Unexpected value for double_click event: {}".format(self.double_click)
             )
-        self.num_backups = kwargs.pop("num_backups", 10)
+        self.num_backups = max(1, int(kwargs.pop("num_backups", 10)))
         self._crosshair = kwargs.pop(
             "crosshair",
             {
@@ -151,6 +151,7 @@ class Canvas(QtWidgets.QWidget):
             logger.debug("AI model is already initialized: %r" % model.name)
         else:
             logger.debug("Initializing AI model: %r" % model.name)
+            self.releaseAiModel()
             self._ai_model = model()
 
         if self.pixmap is None:
@@ -244,9 +245,7 @@ class Canvas(QtWidgets.QWidget):
         for shape in self.shapes:
             shapesBackup.append(shape.copy())
         self.shapesBackups.append(shapesBackup)
-        if self.num_backups <= 0:
-            self.shapesBackups = []
-        elif len(self.shapesBackups) > self.num_backups:
+        if len(self.shapesBackups) > self.num_backups:
             self.shapesBackups = self.shapesBackups[-self.num_backups :]
 
     @property
@@ -988,37 +987,47 @@ class Canvas(QtWidgets.QWidget):
 
     def finalise(self):
         assert self.current
-        if self.createMode == "ai_polygon":
-            # convert points to polygon by an AI model
-            assert self.current.shape_type == "points"
-            points = self._predictAi(
-                "polygon", self.current.points, self.current.point_labels
-            )
-            if len(points) < 3:
-                self.aiPredictionFailed.emit("The AI model returned no polygon.")
-                return
-            self.current.setShapeRefined(
-                points=[QtCore.QPointF(point[0], point[1]) for point in points],
-                point_labels=[1] * len(points),
-                shape_type="polygon",
-            )
-        elif self.createMode == "ai_mask":
-            # convert points to mask by an AI model
-            assert self.current.shape_type == "points"
-            mask = self._predictAi(
-                "mask", self.current.points, self.current.point_labels
-            )
-            mask = np.asarray(mask, dtype=bool)
-            if mask.ndim != 2 or not mask.any():
-                self.aiPredictionFailed.emit("The AI model returned an empty mask.")
-                return
-            y1, x1, y2, x2 = labelme.utils.masks_to_bboxes(mask[None])[0].astype(int)
-            self.current.setShapeRefined(
-                shape_type="mask",
-                points=[QtCore.QPointF(x1, y1), QtCore.QPointF(x2, y2)],
-                point_labels=[1, 1],
-                mask=mask[y1:y2, x1:x2],
-            )
+        try:
+            if self.createMode == "ai_polygon":
+                # convert points to polygon by an AI model
+                assert self.current.shape_type == "points"
+                points = self._predictAi(
+                    "polygon", self.current.points, self.current.point_labels
+                )
+                if points is None or len(points) < 3:
+                    self.aiPredictionFailed.emit("The AI model returned no polygon.")
+                    return
+                self.current.setShapeRefined(
+                    points=[QtCore.QPointF(point[0], point[1]) for point in points],
+                    point_labels=[1] * len(points),
+                    shape_type="polygon",
+                )
+            elif self.createMode == "ai_mask":
+                # convert points to mask by an AI model
+                assert self.current.shape_type == "points"
+                mask_value = self._predictAi(
+                    "mask", self.current.points, self.current.point_labels
+                )
+                if mask_value is None:
+                    self.aiPredictionFailed.emit("The AI model returned an empty mask.")
+                    return
+                mask = np.asarray(mask_value, dtype=bool)
+                if mask.ndim != 2 or not mask.any():
+                    self.aiPredictionFailed.emit("The AI model returned an empty mask.")
+                    return
+                y1, x1, y2, x2 = labelme.utils.masks_to_bboxes(mask[None])[0].astype(
+                    int
+                )
+                self.current.setShapeRefined(
+                    shape_type="mask",
+                    points=[QtCore.QPointF(x1, y1), QtCore.QPointF(x2, y2)],
+                    point_labels=[1, 1],
+                    mask=mask[y1:y2, x1:x2],
+                )
+        except Exception as error:
+            logger.warning("AI shape finalization failed: %s", error)
+            self.aiPredictionFailed.emit("AI prediction failed: {}".format(error))
+            return
         self.current.close()
 
         self.shapes.append(self.current)

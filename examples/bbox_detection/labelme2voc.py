@@ -87,7 +87,7 @@ def main():
             maker.size(
                 maker.height(str(img.shape[0])),
                 maker.width(str(img.shape[1])),
-                maker.depth(str(img.shape[2])),
+                maker.depth(str(labelme.utils.img_arr_channel_count(img))),
             ),
             maker.segmented(),
         )
@@ -132,7 +132,7 @@ def main():
         if not args.noviz:
             captions = [class_names[label] for label in labels]
             viz = imgviz.instances2rgb(
-                image=img,
+                image=labelme.utils.img_arr_to_rgb(img),
                 labels=labels,
                 bboxes=bboxes,
                 captions=captions,

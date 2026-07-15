@@ -326,15 +326,36 @@ class LabelFile(object):
 
 
 def save_label_files_atomically(requests):
-    """Stage and commit several label files as one rollback-capable operation."""
+    """Stage and commit label files, including rollback-safe legacy retirement.
+
+    A request may include the internal ``_retire_sources`` list. Those sources
+    are moved aside only after every destination has been installed, and are
+    restored if any later part of the transaction fails.
+    """
     if not requests:
         return
     staged = []
     committed = []
+    retired = []
     try:
         destinations = [osp.abspath(request["filename"]) for request in requests]
         if len(destinations) != len(set(destinations)):
             raise LabelFileError("Batch contains duplicate annotation destinations")
+        retirement_sources = []
+        for request in requests:
+            sources = request.get("_retire_sources", [])
+            if isinstance(sources, (str, bytes)):
+                sources = [sources]
+            for source in sources:
+                source = osp.abspath(source)
+                if source != osp.abspath(request["filename"]):
+                    retirement_sources.append(source)
+        if len(retirement_sources) != len(set(retirement_sources)):
+            raise LabelFileError("Batch contains duplicate legacy annotation sources")
+        if set(retirement_sources) & set(destinations):
+            raise LabelFileError(
+                "A legacy annotation source cannot also be a batch destination"
+            )
 
         for request, destination in zip(requests, destinations):
             directory = osp.dirname(destination)
@@ -347,6 +368,7 @@ def save_label_files_atomically(requests):
             os.close(fd)
             os.unlink(stage_path)
             arguments = dict(request)
+            arguments.pop("_retire_sources", None)
             arguments["filename"] = stage_path
             LabelFile().save(**arguments)
             staged.append((stage_path, destination))
@@ -367,13 +389,40 @@ def save_label_files_atomically(requests):
             os.replace(stage_path, destination)
             record[2] = True
 
+        for source in retirement_sources:
+            if not osp.exists(source):
+                continue
+            fd, retired_path = tempfile.mkstemp(
+                dir=osp.dirname(source),
+                prefix=".{}-migrated-".format(osp.basename(source)),
+                suffix=".json",
+            )
+            os.close(fd)
+            os.unlink(retired_path)
+            os.replace(source, retired_path)
+            retired.append((source, retired_path))
+
         for _, backup_path, _ in committed:
             if backup_path and osp.exists(backup_path):
                 try:
                     os.unlink(backup_path)
                 except OSError:
                     logger.warning("Could not remove annotation backup %r", backup_path)
+        for _, retired_path in retired:
+            if osp.exists(retired_path):
+                try:
+                    os.unlink(retired_path)
+                except OSError:
+                    logger.warning(
+                        "Could not remove migrated annotation backup %r", retired_path
+                    )
     except Exception as exc:
+        for source, retired_path in reversed(retired):
+            try:
+                if osp.exists(retired_path):
+                    os.replace(retired_path, source)
+            except OSError:
+                logger.exception("Failed restoring legacy annotation %r", source)
         for destination, backup_path, installed in reversed(committed):
             try:
                 if installed and osp.exists(destination):

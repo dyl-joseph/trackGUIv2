@@ -1,4 +1,8 @@
+fastapi>=0.115
 github2pypi==1.0.0
+httpx
+pydantic>=2.7
+python-multipart
 pytest
 pytest-qt
 ruff==0.15.14

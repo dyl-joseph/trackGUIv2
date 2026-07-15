@@ -5,6 +5,7 @@ import collections
 import datetime
 import glob
 import json
+import math
 import os
 import os.path as osp
 import sys
@@ -33,6 +34,28 @@ def load_categories(filename):
             raise ValueError("Duplicate category name: {}".format(class_name))
         class_name_to_id[class_name] = len(class_name_to_id) + 1
     return class_name_to_id
+
+
+def find_label_files(input_dir):
+    pattern = osp.join(osp.abspath(input_dir), "**", "*.json")
+    return sorted(glob.glob(pattern, recursive=True))
+
+
+def relative_output_stem(filename, input_dir):
+    relative = osp.relpath(osp.abspath(filename), osp.abspath(input_dir))
+    return osp.splitext(relative)[0]
+
+
+def ensure_parent(filename):
+    os.makedirs(osp.dirname(filename), exist_ok=True)
+
+
+def shape_points_are_finite(shape):
+    try:
+        points = np.asarray(shape.get("points", []), dtype=float)
+    except (TypeError, ValueError):
+        return False
+    return points.ndim == 2 and points.shape[1:] == (2,) and np.isfinite(points).all()
 
 
 def main():
@@ -98,14 +121,15 @@ def main():
         )
 
     out_ann_file = osp.join(args.output_dir, "annotations.json")
-    label_files = sorted(glob.glob(osp.join(args.input_dir, "*.json")))
+    label_files = find_label_files(args.input_dir)
     for image_id, filename in enumerate(label_files, start=1):
         print("Generating dataset from:", filename)
 
         label_file = labelme.LabelFile(filename=filename)
 
-        base = osp.splitext(osp.basename(filename))[0]
-        out_img_file = osp.join(args.output_dir, "JPEGImages", base + ".jpg")
+        relative_stem = relative_output_stem(filename, args.input_dir)
+        out_img_file = osp.join(args.output_dir, "JPEGImages", relative_stem + ".jpg")
+        ensure_parent(out_img_file)
 
         img = labelme.utils.img_data_to_arr(label_file.imageData)
         imgviz.io.imsave(out_img_file, img)
@@ -125,12 +149,24 @@ def main():
         segmentations = collections.defaultdict(list)  # for segmentation
         requires_rle = collections.defaultdict(bool)
         for shape in label_file.shapes:
+            if not shape_points_are_finite(shape):
+                print("Skipping shape with invalid coordinates in:", filename)
+                continue
             points = shape["points"]
             label = shape["label"]
             group_id = shape.get("group_id")
             shape_type = shape.get("shape_type", "polygon")
-            mask, _ = labelme.utils.shapes_to_label(img.shape[:2], [shape], {label: 1})
+            try:
+                mask, _ = labelme.utils.shapes_to_label(
+                    img.shape[:2], [shape], {label: 1}
+                )
+            except (AssertionError, OverflowError, TypeError, ValueError) as exc:
+                print("Skipping invalid shape in {}: {}".format(filename, exc))
+                continue
             mask = mask.astype(bool)
+            if not mask.any():
+                print("Skipping out-of-bounds or empty shape in:", filename)
+                continue
 
             if group_id is None:
                 group_id = uuid.uuid1()
@@ -159,6 +195,17 @@ def main():
             encoded_mask = pycocotools.mask.encode(mask)
             area = float(pycocotools.mask.area(encoded_mask))
             bbox = pycocotools.mask.toBbox(encoded_mask).flatten().tolist()
+            if (
+                not mask.any()
+                or not math.isfinite(area)
+                or area <= 0
+                or len(bbox) != 4
+                or not all(math.isfinite(float(value)) for value in bbox)
+                or float(bbox[2]) <= 0
+                or float(bbox[3]) <= 0
+            ):
+                print("Skipping empty or invalid instance in:", filename)
+                continue
             if requires_rle[instance]:
                 encoded_mask["counts"] = encoded_mask["counts"].decode("ascii")
                 segmentation = encoded_mask
@@ -178,9 +225,7 @@ def main():
             )
 
         if not args.noviz:
-            viz = img
-            if viz.ndim == 2:
-                viz = np.repeat(viz[:, :, None], 3, axis=2)
+            viz = labelme.utils.img_arr_to_rgb(img)
             if masks:
                 known_instances = [
                     (class_name_to_id[cnm], cnm, msk)
@@ -197,7 +242,10 @@ def main():
                         font_size=15,
                         line_width=2,
                     )
-            out_viz_file = osp.join(args.output_dir, "Visualization", base + ".jpg")
+            out_viz_file = osp.join(
+                args.output_dir, "Visualization", relative_stem + ".jpg"
+            )
+            ensure_parent(out_viz_file)
             imgviz.io.imsave(out_viz_file, viz)
 
     with open(out_ann_file, "w") as f:

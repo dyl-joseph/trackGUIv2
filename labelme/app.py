@@ -9,6 +9,7 @@ import os.path as osp
 import re
 import threading
 import webbrowser
+from collections import OrderedDict
 
 import cv2  # noqa: F401
 import imgviz
@@ -23,6 +24,8 @@ from scipy.optimize import linear_sum_assignment
 from labelme import PY2
 from labelme import __appname__
 from labelme.ai import MODELS
+from labelme.annotation_path import canonical_annotation_path
+from labelme.annotation_path import legacy_annotation_paths
 from labelme.annotation_path import resolve_annotation_path
 from labelme.config import get_config
 from labelme.hosted_sam2_client import HostedSam2Client
@@ -36,7 +39,9 @@ from labelme.track_algo import KalmanBoxTracker
 from labelme.track_algo import SORT_main
 from labelme.tracking_utils import interpolation_indices
 from labelme.tracking_utils import normalized_rectangle_points
+from labelme.tracking_utils import prediction_to_clamped_rectangle
 from labelme.tracking_utils import shape_track_id
+from labelme.tracking_utils import upsert_tracked_rectangle
 from labelme.widgets import BrightnessContrastDialog
 from labelme.widgets import Canvas
 from labelme.widgets import DeletionDialog
@@ -168,7 +173,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._copied_shapes = None
         self._hosted_sam2_client = HostedSam2Client.from_config(self._config)
-        self._hosted_sam2_image_cache = {}
+        self._hosted_sam2_image_cache = OrderedDict()
         self._hosted_sam2_thread = None
         self._hosted_sam2_worker = None
         self._hosted_sam2_request_active = False
@@ -1307,6 +1312,30 @@ class MainWindow(QtWidgets.QMainWindow):
             explicit_label_path=explicit_label_path,
         )
 
+    def _canonicalJsonPath(self, image_path=None):
+        image_path = image_path or getattr(self, "filename", None)
+        return canonical_annotation_path(
+            image_path=image_path,
+            output_dir=self.output_dir,
+            image_root=self.lastOpenDir,
+        )
+
+    def _legacyAnnotationSources(self, image_path, destination):
+        """Return unambiguous legacy sources that a canonical save retires."""
+        canonical = self._canonicalJsonPath(image_path)
+        if not canonical or not destination:
+            return []
+        canonical = osp.abspath(canonical)
+        destination = osp.abspath(destination)
+        if destination != canonical:
+            return []
+        return legacy_annotation_paths(
+            image_path,
+            output_dir=self.output_dir,
+            image_root=self.lastOpenDir,
+            image_paths=self.imageList,
+        )
+
     def _loadLabelForImage(self, image_path):
         path = self._resolveJsonPath(image_path=image_path, for_write=False)
         if path and osp.isfile(path):
@@ -1339,7 +1368,7 @@ class MainWindow(QtWidgets.QMainWindow):
             image_data = LabelFile.load_image_file(image_path)
             if image_data is None:
                 raise LabelFileError("Cannot embed target image: {}".format(image_path))
-        return dict(
+        request = dict(
             filename=destination,
             shapes=shapes,
             imagePath=self._relativeImagePath(image_path, destination),
@@ -1349,6 +1378,10 @@ class MainWindow(QtWidgets.QMainWindow):
             otherData=label_file.otherData if label_file else {},
             flags=label_file.flags if label_file else {},
         )
+        legacy_sources = self._legacyAnnotationSources(image_path, destination)
+        if legacy_sources:
+            request["_retire_sources"] = legacy_sources
+        return request
 
     def _saveLabelBatch(self, requests, title):
         try:
@@ -1786,17 +1819,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
+        interpolation_list = [self.imageList[index] for index in img_indices]
+        interpolation_filename = interpolation_list[0]
+        if not self.loadFile(interpolation_filename):
+            return
+
         self.start_INP0 = start_frame
         self.end_INP0 = end_frame
         self.interval_INPO = interval
         self.ID_INPO = options.track_id
         self.label_INPO = options.label
-
         self.mode = "TRACK INTERPOLATION"
         self.INTERPOLATION_indices = img_indices
-        self.INTERPOLATION_list = [self.imageList[index] for index in img_indices]
-        self.INTERPOLATION_filename = self.INTERPOLATION_list[0]
-        self.loadFile(self.INTERPOLATION_filename)
+        self.INTERPOLATION_list = interpolation_list
+        self.INTERPOLATION_filename = interpolation_filename
 
     def OKAY(self, item=None):
         from sklearn.gaussian_process import GaussianProcessRegressor
@@ -1874,49 +1910,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not size.isValid():
                     raise ValueError("Cannot read target image: {}".format(image_path))
 
-                center_x, center_y, width, height = predictions[offset]
-                x1, x2 = sorted((center_x - width / 2, center_x + width / 2))
-                y1, y2 = sorted((center_y - height / 2, center_y + height / 2))
-                x1 = min(max(0.0, x1), max(0.0, size.width() - 1.0))
-                y1 = min(max(0.0, y1), max(0.0, size.height() - 1.0))
-                x2 = min(max(0.0, x2), float(size.width()))
-                y2 = min(max(0.0, y2), float(size.height()))
-                if x2 <= x1 or y2 <= y1:
-                    raise ValueError(
-                        "Interpolation produced an empty box for frame {}.".format(
-                            image_index + 1
-                        )
-                    )
-
-                matching = [
-                    shape
-                    for shape in shapes
-                    if shape.get("label") == self.label_INPO
-                    and str(shape_track_id(shape)) == self.ID_INPO
-                ]
-                new_shape = dict(matching[0]) if matching else {}
-                new_shape.update(
-                    label=self.label_INPO,
-                    points=[[x1, y1], [x2, y2]],
-                    shape_type="rectangle",
-                    flags=new_shape.get("flags", {}),
-                    description=new_shape.get("description", ""),
-                    group_id=new_shape.get(
-                        "group_id",
-                        int(self.ID_INPO) if self.ID_INPO.isdigit() else self.ID_INPO,
-                    ),
-                    track_id=self.ID_INPO,
-                    mask=None,
+                points = prediction_to_clamped_rectangle(
+                    predictions[offset], size.width(), size.height()
                 )
-                shapes = [
-                    shape
-                    for shape in shapes
-                    if not (
-                        shape.get("label") == self.label_INPO
-                        and str(shape_track_id(shape)) == self.ID_INPO
-                    )
-                ]
-                shapes.append(new_shape)
+
+                shapes = upsert_tracked_rectangle(
+                    shapes,
+                    self.label_INPO,
+                    self.ID_INPO,
+                    points,
+                )
                 requests.append(self._labelSaveRequest(image_path, shapes, label_file))
         except (LabelFileError, ValueError) as exc:
             self.errorMessage("Box Interpolation", str(exc))
@@ -2088,29 +2091,14 @@ class MainWindow(QtWidgets.QMainWindow):
     ):
         loaded = self._loadLabelForImage(img_path)
         shapes = list(loaded.shapes) if loaded else []
-
-        updated = False
-        tid_str = str(track_id) if track_id is not None else None
-        for s in shapes:
-            s_tid_value = shape_track_id(s)
-            s_tid = str(s_tid_value) if s_tid_value is not None else None
-            if s["label"] == label and s_tid == tid_str:
-                s["points"] = new_points
-                updated = True
-                break
-        if not updated:
-            shapes.append(
-                dict(
-                    label=label,
-                    points=new_points,
-                    group_id=group_id,
-                    track_id=track_id,
-                    shape_type="rectangle",
-                    flags={},
-                    description="",
-                    mask=None,
-                )
-            )
+        points = normalized_rectangle_points(new_points)
+        shapes = upsert_tracked_rectangle(
+            shapes,
+            label,
+            track_id,
+            points,
+            group_id=group_id,
+        )
 
         request = self._labelSaveRequest(img_path, shapes, loaded)
         request["imageHeight"] = img_shape[0]
@@ -2366,10 +2354,11 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.progress.connect(self._trackingProgressUpdated)
         worker.finished.connect(self._trackingWorkerFinished)
         worker.failed.connect(self._trackingWorkerFailed)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         progress.canceled.connect(self._cancelTrackingWorker)
-        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._trackingWorkerCleanedUp)
         progress.show()
@@ -2604,10 +2593,10 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
-        self.canvas.initializeAiModel("EfficientSam (speed)")
-        ai_model = self.canvas._ai_model
-        refined = 0
+        refinements = []
         try:
+            self.canvas.initializeAiModel("EfficientSam (speed)")
+            ai_model = self.canvas._ai_model
             for shape in shapes:
                 p1, p2 = shape.points[0], shape.points[1]
                 box = [
@@ -2620,16 +2609,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 if mask is None or not np.asarray(mask).any():
                     continue
                 ys, xs = np.where(mask)
-                shape.points[0] = QtCore.QPointF(float(xs.min()), float(ys.min()))
-                shape.points[1] = QtCore.QPointF(
-                    float(xs.max() + 1), float(ys.max() + 1)
+                refinements.append(
+                    (
+                        shape,
+                        QtCore.QPointF(float(xs.min()), float(ys.min())),
+                        QtCore.QPointF(float(xs.max() + 1), float(ys.max() + 1)),
+                    )
                 )
-                refined += 1
+        except Exception as exc:
+            self.errorMessage("Refine Bbox (AI)", str(exc))
+            return
         finally:
             self.canvas.releaseAiModel()
-        if not refined:
+        if not refinements:
             self.status("The AI model returned no usable masks.", delay=8000)
             return
+        for shape, top_left, bottom_right in refinements:
+            shape.points[0] = top_left
+            shape.points[1] = bottom_right
+        self.canvas.storeShapes()
         self.canvas.update()
         self.setDirty()
 
@@ -2651,18 +2649,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setEditMode()
         self.canvas.cancelPointPrompt(emit_signal=False)
         frame_key = self._hostedSam2FrameKey()
-        cached_image = self._hosted_sam2_image_cache.get(frame_key)
+        cached_image = self._hostedSam2CachedImage(frame_key)
         if cached_image is not None:
             self._armHostedSam2PointPrompt()
             return
 
+        image_data = bytes(self.imageData)
         self.status("Registering current frame with hosted SAM2...")
         self._runHostedSam2Request(
             self._hosted_sam2_client.register_image,
             self._hostedSam2ImageRegistered,
-            self.imageData,
+            image_data,
             client_frame_key=frame_key,
-            _context={"frame_key": frame_key},
+            _context={"frame_key": frame_key, "image_data": image_data},
         )
 
     def _hostedSam2FrameKey(self):
@@ -2686,6 +2685,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Cannot arm point prompt without an image.",
             )
 
+    def _hostedSam2CachedImage(self, frame_key):
+        image_info = self._hosted_sam2_image_cache.get(frame_key)
+        if image_info is not None:
+            self._hosted_sam2_image_cache.move_to_end(frame_key)
+        return image_info
+
+    def _rememberHostedSam2Image(self, frame_key, response):
+        self._hosted_sam2_image_cache[frame_key] = response
+        self._hosted_sam2_image_cache.move_to_end(frame_key)
+        while len(self._hosted_sam2_image_cache) > self._hosted_sam2_max_cached_frames:
+            self._hosted_sam2_image_cache.popitem(last=False)
+
     def _hostedSam2ImageRegistered(self, response, context):
         frame_key = context["frame_key"]
         if frame_key != self._hostedSam2FrameKey():
@@ -2700,21 +2711,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Backend image dimensions do not match the current frame.",
             )
             return
-        self._hosted_sam2_image_cache[frame_key] = response
-        while len(self._hosted_sam2_image_cache) > self._hosted_sam2_max_cached_frames:
-            oldest_key = next(iter(self._hosted_sam2_image_cache))
-            self._hosted_sam2_image_cache.pop(oldest_key, None)
+        self._rememberHostedSam2Image(frame_key, response)
         retry_point = context.get("retry_point")
         if retry_point is not None:
             self._sendHostedSam2PointPrompt(
-                frame_key, retry_point[0], retry_point[1], retry_count=1
+                frame_key,
+                retry_point[0],
+                retry_point[1],
+                retry_count=1,
+                image_data=context.get("image_data"),
             )
             return
         self._armHostedSam2PointPrompt()
 
     def _hostedSam2PointPrompt(self, point):
         frame_key = self._hostedSam2FrameKey()
-        image_info = self._hosted_sam2_image_cache.get(frame_key)
+        image_info = self._hostedSam2CachedImage(frame_key)
         if image_info is None:
             self.errorMessage("Hosted SAM2", "Current frame is not registered.")
             return
@@ -2724,11 +2736,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._sendHostedSam2PointPrompt(frame_key, point.x(), point.y())
 
-    def _sendHostedSam2PointPrompt(self, frame_key, x, y, retry_count=0):
-        image_info = self._hosted_sam2_image_cache.get(frame_key)
+    def _sendHostedSam2PointPrompt(
+        self, frame_key, x, y, retry_count=0, image_data=None
+    ):
+        image_info = self._hostedSam2CachedImage(frame_key)
         if image_info is None:
             self.errorMessage("Hosted SAM2", "Current frame is not registered.")
             return
+        if frame_key != self._hostedSam2FrameKey():
+            self.status("Ignored hosted SAM2 prompt for a stale frame.")
+            return
+        if image_data is None:
+            image_data = bytes(self.imageData)
         self.status("Sending SAM2 point prompt...")
         self._runHostedSam2Request(
             self._hosted_sam2_client.point_prompt,
@@ -2742,6 +2761,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "frame_key": frame_key,
                 "point": (float(x), float(y)),
                 "retry_count": retry_count,
+                "image_data": image_data,
             },
         )
 
@@ -2796,9 +2816,10 @@ class MainWindow(QtWidgets.QMainWindow):
         thread.started.connect(worker.run)
         worker.finished.connect(self._hostedSam2WorkerFinished)
         worker.failed.connect(self._hostedSam2RequestFailed)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._hostedSam2RequestCleanedUp)
         thread.start()
@@ -2830,15 +2851,25 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             frame_key = context["frame_key"]
             self._hosted_sam2_image_cache.pop(frame_key, None)
+            if frame_key != self._hostedSam2FrameKey():
+                self.status("Ignored hosted SAM2 retry for a stale frame.")
+                return
+            image_data = context.get("image_data")
+            if image_data is None:
+                self.errorMessage(
+                    "Hosted SAM2", "Cannot retry because the frame data is unavailable."
+                )
+                return
             self.status("SAM2 cache expired; registering the frame again...")
             self._runHostedSam2Request(
                 self._hosted_sam2_client.register_image,
                 self._hostedSam2ImageRegistered,
-                self.imageData,
+                image_data,
                 client_frame_key=frame_key,
                 _context={
                     "frame_key": frame_key,
                     "retry_point": context["point"],
+                    "image_data": image_data,
                 },
             )
             return
@@ -2884,6 +2915,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         item.setText(shape.track_id)
         self._update_shape_color(shape)
+        self.canvas.storeShapes()
         self.setDirty()
 
     def editLabel(self, item=None):
@@ -2936,6 +2968,7 @@ class MainWindow(QtWidgets.QMainWindow):
             id_item.setText(str(shape.track_id))
         except ValueError:
             pass
+        self.canvas.storeShapes()
         self.setDirty()
         self._ensureLabelSelector(shape.label)
 
@@ -3140,29 +3173,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._noSelectionSlot = False
         self.canvas.loadShapes(shapes, replace=replace)
 
-    def loadLabels(self, shapes):
-        s = []
-        for shape in shapes:
-            label = shape["label"]
-            points = shape["points"]
-            shape_type = shape["shape_type"]
-            flags = shape["flags"]
-            description = shape.get("description", "")
-            group_id = shape.get("group_id")
-            track_id = shape.get("track_id")
-            other_data = dict(shape.get("other_data", {}))
+    def _deserializeShapes(self, shapes):
+        deserialized = []
+        for index, shape_data in enumerate(shapes):
+            if not isinstance(shape_data, dict):
+                raise ValueError("shape {} must be an object".format(index + 1))
+            label = shape_data["label"]
+            if not isinstance(label, str) or not label:
+                raise ValueError(
+                    "shape {} must have a non-empty string label".format(index + 1)
+                )
+            points = shape_data["points"]
+            shape_type = shape_data["shape_type"]
+            flags = shape_data["flags"]
+            if not isinstance(flags, dict):
+                raise ValueError("shape {} flags must be an object".format(index + 1))
+            description = shape_data.get("description", "")
+            group_id = shape_data.get("group_id")
+            track_id = shape_data.get("track_id")
+            other_data_value = shape_data.get("other_data", {})
+            if not isinstance(other_data_value, dict):
+                raise ValueError(
+                    "shape {} metadata must be an object".format(index + 1)
+                )
+            other_data = dict(other_data_value)
             if track_id is None or track_id == "":
                 track_id = group_id
 
             if not points:
                 # skip point-empty shape
                 continue
+            validated_points = []
+            for point in points:
+                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                    raise ValueError(
+                        "shape {} points must be coordinate pairs".format(index + 1)
+                    )
+                if any(isinstance(value, bool) for value in point):
+                    raise ValueError(
+                        "shape {} coordinates must be finite numbers".format(index + 1)
+                    )
+                try:
+                    x, y = (float(value) for value in point)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "shape {} coordinates must be finite numbers".format(index + 1)
+                    ) from exc
+                if not math.isfinite(x) or not math.isfinite(y):
+                    raise ValueError(
+                        "shape {} coordinates must be finite numbers".format(index + 1)
+                    )
+                validated_points.append([x, y])
+            points = validated_points
 
             if (
                 self.ir_activated
                 and label == self.ir_name
                 and str(track_id) == str(self.ir_id)
             ):
+                if len(points) != 2:
+                    raise ValueError(
+                        "shape {} cannot be refined because it is not a box".format(
+                            index + 1
+                        )
+                    )
                 deltas = [
                     [
                         self.ir_mod_shape[0][0] - self.ir_old_shape[0][0],
@@ -3176,12 +3250,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 points = [
                     [
-                        shape["points"][0][0] + deltas[0][0],
-                        shape["points"][0][1] + deltas[0][1],
+                        points[0][0] + deltas[0][0],
+                        points[0][1] + deltas[0][1],
                     ],
                     [
-                        shape["points"][1][0] + deltas[1][0],
-                        shape["points"][1][1] + deltas[1][1],
+                        points[1][0] + deltas[1][0],
+                        points[1][1] + deltas[1][1],
                     ],
                 ]
 
@@ -3191,7 +3265,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 group_id=group_id,
                 track_id=track_id,
                 description=description,
-                mask=shape["mask"],
+                mask=shape_data["mask"],
             )
             shape.other_data = other_data
             for x, y in points:
@@ -3207,8 +3281,11 @@ class MainWindow(QtWidgets.QMainWindow):
             shape.flags = default_flags
             shape.flags.update(flags)
 
-            s.append(shape)
-        self.loadShapes(s)
+            deserialized.append(shape)
+        return deserialized
+
+    def loadLabels(self, shapes):
+        self.loadShapes(self._deserializeShapes(shapes))
 
     def loadFlags(self, flags):
         self.flag_widget.clear()
@@ -3219,8 +3296,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.flag_widget.addItem(item)
 
     def saveLabels(self, filename):
-        lf = LabelFile()
-
         def format_shape(s):
             return dict(
                 label=s.label.encode("utf-8") if PY2 else s.label,
@@ -3252,10 +3327,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 osp.join(label_dir, relative_image_path)
             ):
                 imagePath = relative_image_path
-            imageData = self.imageData if self._config["store_data"] else None
-            if osp.dirname(filename) and not osp.exists(osp.dirname(filename)):
-                os.makedirs(osp.dirname(filename))
-            lf.save(
+            preserve_embedded_data = bool(
+                self.labelFile is not None and self.labelFile.imageDataEmbedded
+            )
+            imageData = (
+                self.imageData
+                if self._config["store_data"] or preserve_embedded_data
+                else None
+            )
+            request = dict(
                 filename=filename,
                 shapes=shapes,
                 imagePath=imagePath,
@@ -3265,7 +3345,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 otherData=self.otherData or {},
                 flags=flags,
             )
-            self.labelFile = lf
+            legacy_sources = self._legacyAnnotationSources(self.filename, filename)
+            if legacy_sources:
+                request["_retire_sources"] = legacy_sources
+            save_label_files_atomically([request])
+            self.labelFile = LabelFile(filename)
             items = self.fileListWidget.findItems(self.filename, Qt.MatchExactly)
             if len(items) > 0:
                 if len(items) != 1:
@@ -3274,7 +3358,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # disable allows next and previous image to proceed
             # self.filename = filename
             return True
-        except (LabelFileError, OSError, ValueError) as e:
+        except (LabelFileError, OSError, RuntimeError, ValueError) as e:
             self.errorMessage(
                 self.tr("Error saving label data"), self.tr("<b>%s</b>") % e
             )
@@ -3552,6 +3636,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         self.status(str(self.tr("Loading %s...")) % osp.basename(str(filename)))
         explicit_label_path = filename if LabelFile.is_label_file(filename) else None
+        if explicit_label_path is None and filename == self.filename:
+            explicit_label_path = self._explicit_label_path
         label_file = explicit_label_path or self._resolveJsonPath(
             image_path=filename, for_write=False
         )
@@ -3622,6 +3708,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status(self.tr("Error reading %s") % actual_filename)
             return False
 
+        loaded_shapes = []
+        flags = {k: False for k in self._config["flags"] or []}
+        try:
+            if loaded_label_file is not None:
+                loaded_shapes = self._deserializeShapes(loaded_label_file.shapes)
+                if not isinstance(loaded_label_file.flags, dict):
+                    raise ValueError("top-level flags must be an object")
+                flags.update(loaded_label_file.flags)
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            self.errorMessage(
+                self.tr("Error opening file"),
+                self.tr("Invalid annotation data in %s: %s") % (label_file, exc),
+            )
+            self.status(self.tr("Error reading %s") % label_file)
+            return False
+
         prev_shapes = list(self.canvas.shapes) if self._config["keep_prev"] else []
         self.resetState(release_ai_model=False)
         self.canvas.setEnabled(False)
@@ -3636,11 +3738,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filename = actual_filename
         self._explicit_label_path = explicit_label_path
         self.canvas.loadPixmap(QtGui.QPixmap.fromImage(image))
-        flags = {k: False for k in self._config["flags"] or []}
-        if self.labelFile:  # if labelFile exists
-            self.loadLabels(self.labelFile.shapes)  # FIX loadLabels HERE
-            if self.labelFile.flags is not None:
-                flags.update(self.labelFile.flags)
+        if loaded_shapes:
+            self.loadShapes(loaded_shapes)
         self.loadFlags(flags)
         if (
             self._config["keep_prev"] and self.noShapes()
@@ -3771,6 +3870,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status("Waiting for the active hosted SAM2 request to finish...")
             event.ignore()
             return
+        self._close_after_tracking = False
+        self._close_after_hosted_request = False
         if not self.mayContinue():
             event.ignore()
             return
@@ -3964,21 +4065,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if not output_dir:
             return
 
+        previous_output_dir = self.output_dir
+        current_filename = self.filename
         self.output_dir = output_dir
+        self.importDirImages(self.lastOpenDir, load=False)
+        if current_filename and not self.loadFile(current_filename):
+            self.output_dir = previous_output_dir
+            self.importDirImages(self.lastOpenDir, load=False)
+            self._restoreCurrentFileSelection()
+            self.status(
+                self.tr("Could not load annotations from the selected directory.")
+            )
+            return
 
         self.statusBar().showMessage(
             self.tr("%s . Annotations will be saved/loaded in %s")
             % ("Change Annotations Dir", self.output_dir)
         )
         self.statusBar().show()
-
-        current_filename = self.filename
-        self.importDirImages(self.lastOpenDir, load=False)
-
-        if current_filename in self.imageList:
-            # retain currently selected file
-            self.fileListWidget.setCurrentRow(self.imageList.index(current_filename))
-            self.fileListWidget.repaint()
 
     def saveFile(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
@@ -3991,7 +4095,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def saveFileAs(self, _value=False):
         assert not self.image.isNull(), "cannot save empty image"
-        return self._saveFile(self.saveFileDialog())
+        return self._saveFile(self.saveFileDialog(), remember_explicit_path=True)
 
     def saveFileDialog(self):
         caption = self.tr("%s - Choose File") % __appname__
@@ -4021,8 +4125,10 @@ class MainWindow(QtWidgets.QMainWindow):
             filename, _ = filename
         return filename
 
-    def _saveFile(self, filename):
+    def _saveFile(self, filename, remember_explicit_path=False):
         if filename and self.saveLabels(filename):
+            if remember_explicit_path:
+                self._explicit_label_path = osp.abspath(filename)
             self.addRecentFile(filename)
             self.setClean()
             return True

@@ -140,6 +140,20 @@ def test_readiness_distinguishes_loaded_predictor_from_missing_configuration():
     assert not_ready.readiness()["ready"] is False
 
 
+def test_readiness_surfaces_predictor_initialization_failure(monkeypatch):
+    service = Sam2Service()
+
+    def fail_to_initialize():
+        raise Sam2ServiceError(503, "checkpoint is incompatible")
+
+    monkeypatch.setattr(service, "_ensure_predictor", fail_to_initialize)
+
+    readiness = service.readiness()
+
+    assert readiness["ready"] is False
+    assert readiness["detail"] == "checkpoint is incompatible"
+
+
 def test_point_prompt_rejects_boolean_label_and_invalid_image_id():
     service = Sam2Service(predictor=FakePredictor(np.ones((6, 8), dtype=bool)))
     registered = service.register_image(_image_bytes(width=8, height=6))

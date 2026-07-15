@@ -8,6 +8,26 @@ import PIL.ImageOps
 from qtpy import QtGui
 
 
+def img_arr_channel_count(img_arr):
+    img_arr = np.asarray(img_arr)
+    if img_arr.ndim == 2:
+        return 1
+    if img_arr.ndim == 3 and img_arr.shape[2] > 0:
+        return img_arr.shape[2]
+    raise ValueError("Image array must have shape HxW or HxWxC")
+
+
+def img_arr_to_rgb(img_arr):
+    img_arr = np.asarray(img_arr)
+    channels = img_arr_channel_count(img_arr)
+    if channels == 1:
+        gray = img_arr if img_arr.ndim == 2 else img_arr[:, :, 0]
+        return np.repeat(gray[:, :, None], 3, axis=2)
+    if channels >= 3:
+        return img_arr[:, :, :3]
+    raise ValueError("Image array must have one or at least three channels")
+
+
 def img_data_to_pil(img_data):
     f = io.BytesIO()
     f.write(img_data)

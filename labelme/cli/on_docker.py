@@ -28,17 +28,19 @@ def labelme_on_docker(in_file, out_file):
     xhost_rule = xhost_target if xhost_target else "local:docker"
     xhost_enabled = bool(shutil.which("xhost"))
 
+    temporary_directory = None
     temporary_output = None
     if out_file:
         out_file = osp.abspath(out_file)
         if osp.exists(out_file):
             raise RuntimeError("File exists: %s" % out_file)
-        fd, temporary_output = tempfile.mkstemp(
-            dir=osp.dirname(out_file) or None,
+        output_directory = osp.dirname(out_file)
+        os.makedirs(output_directory, exist_ok=True)
+        temporary_directory = tempfile.mkdtemp(
+            dir=output_directory,
             prefix=".{}-".format(osp.basename(out_file)),
-            suffix=".tmp",
         )
-        os.close(fd)
+        temporary_output = osp.join(temporary_directory, osp.basename(out_file))
 
     in_file_a = osp.abspath(in_file)
     in_file_b = osp.join("/home/developer", osp.basename(in_file))
@@ -59,9 +61,9 @@ def labelme_on_docker(in_file, out_file):
     if osp.isdir("/tmp/.X11-unix"):
         cmd.extend(["-v", "/tmp/.X11-unix:/tmp/.X11-unix"])
     if out_file:
-        out_file_a = temporary_output
-        out_file_b = osp.join("/home/developer", osp.basename(out_file))
-        cmd.extend(["-v", "{}:{}".format(out_file_a, out_file_b)])
+        output_mount = "/home/developer/labelme-output"
+        out_file_b = osp.join(output_mount, osp.basename(out_file))
+        cmd.extend(["-v", "{}:{}".format(temporary_directory, output_mount)])
     cmd.extend(["wkentaro/labelme", "labelme", in_file_b])
     if out_file:
         cmd.extend(["-O", out_file_b])
@@ -76,7 +78,6 @@ def labelme_on_docker(in_file, out_file):
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise RuntimeError("Annotation is cancelled or invalid.") from exc
             os.replace(temporary_output, out_file)
-            temporary_output = None
             return out_file
     except subprocess.CalledProcessError as exc:
         raise RuntimeError("Docker annotation failed: {}".format(exc)) from exc
@@ -86,8 +87,8 @@ def labelme_on_docker(in_file, out_file):
                 ["xhost", "-{}".format(xhost_rule)],
                 check=False,
             )
-        if temporary_output and osp.exists(temporary_output):
-            os.unlink(temporary_output)
+        if temporary_directory:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
 
 
 def main():

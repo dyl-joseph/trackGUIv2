@@ -49,3 +49,16 @@ def test_images_outside_sequence_root_get_collision_safe_output_paths(tmp_path):
     assert first_path != second_path
     assert first_path.startswith(str(output / "_external"))
     assert second_path.startswith(str(output / "_external"))
+
+
+def test_images_without_sequence_root_get_collision_safe_output_paths(tmp_path):
+    first = tmp_path / "external1" / "frame.jpg"
+    second = tmp_path / "external2" / "frame.jpg"
+    output = tmp_path / "labels"
+
+    first_path = canonical_annotation_path(first, output)
+    second_path = canonical_annotation_path(second, output)
+
+    assert first_path != second_path
+    assert first_path.startswith(str(output / "_external"))
+    assert second_path.startswith(str(output / "_external"))

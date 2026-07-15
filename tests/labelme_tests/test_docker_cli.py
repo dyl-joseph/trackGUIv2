@@ -7,12 +7,13 @@ import pytest
 from labelme.cli import on_docker
 
 
-def _mounted_output_path(command, destination_name):
+def _mounted_output_path(command):
+    output_path = Path(command[command.index("-O") + 1])
     for index, argument in enumerate(command):
         if argument == "-v":
             source, destination = command[index + 1].split(":", 1)
-            if destination.endswith(destination_name):
-                return Path(source)
+            if Path(destination) == output_path.parent:
+                return Path(source) / output_path.name
     raise AssertionError("output mount was not present")
 
 
@@ -30,7 +31,7 @@ def test_docker_helper_revokes_xhost_and_atomically_installs_output(
     def fake_run(command, check):
         commands.append(command)
         if command[0] == "docker":
-            temporary = _mounted_output_path(command, output_file.name)
+            temporary = _mounted_output_path(command)
             temporary.write_text(json.dumps({"shapes": []}), encoding="utf-8")
 
     monkeypatch.setattr(on_docker.subprocess, "run", fake_run)
@@ -64,4 +65,4 @@ def test_docker_helper_removes_temporary_output_after_failure(monkeypatch, tmp_p
 
     assert not output_file.exists()
     assert commands[-1][0:2] == ["xhost", "-local:docker"]
-    assert list(tmp_path.glob(".frame.json-*.tmp")) == []
+    assert list(tmp_path.glob(".frame.json-*")) == []

@@ -38,7 +38,52 @@ def canonical_annotation_path(image_path, output_dir=None, image_root=None):
                 osp.dirname(image_path).encode("utf-8")
             ).hexdigest()[:12]
             relative_path = osp.join("_external", parent_key, relative_path)
+    else:
+        parent_key = hashlib.sha256(
+            osp.dirname(image_path).encode("utf-8")
+        ).hexdigest()[:12]
+        relative_path = osp.join("_external", parent_key, relative_path)
     return osp.join(osp.abspath(output_dir), _replace_extension(relative_path))
+
+
+def legacy_annotation_paths(
+    image_path, output_dir=None, image_root=None, image_paths=()
+):
+    """Return existing, unambiguous legacy flat paths for an image."""
+    if image_path is None:
+        return []
+    image_path = osp.abspath(osp.normpath(image_path))
+    if image_path.lower().endswith(".json"):
+        return []
+    canonical = canonical_annotation_path(image_path, output_dir, image_root)
+    basename = osp.basename(image_path)
+    matching_basenames = [
+        path
+        for path in image_paths
+        if osp.basename(osp.normpath(str(path))) == basename
+    ]
+    if len(matching_basenames) > 1:
+        return []
+
+    candidates = []
+    if output_dir:
+        candidates.append(
+            osp.join(osp.abspath(output_dir), _replace_extension(basename))
+        )
+    if image_root:
+        candidates.append(
+            osp.join(osp.abspath(image_root), _replace_extension(basename))
+        )
+    paths = []
+    for candidate in candidates:
+        candidate = osp.abspath(candidate)
+        if (
+            candidate != osp.abspath(canonical)
+            and candidate not in paths
+            and osp.isfile(candidate)
+        ):
+            paths.append(candidate)
+    return paths
 
 
 def resolve_annotation_path(
@@ -57,28 +102,11 @@ def resolve_annotation_path(
     if for_write or canonical is None or osp.isfile(canonical):
         return canonical
 
-    image_path = osp.abspath(osp.normpath(image_path))
-    basename = osp.basename(image_path)
-    matching_basenames = [
-        path
-        for path in image_paths
-        if osp.basename(osp.normpath(str(path))) == basename
-    ]
-    if len(matching_basenames) > 1:
-        return canonical
-
-    legacy_paths = []
-    if output_dir:
-        legacy_paths.append(
-            osp.join(osp.abspath(output_dir), _replace_extension(basename))
-        )
-    if image_root:
-        legacy_paths.append(
-            osp.join(osp.abspath(image_root), _replace_extension(basename))
-        )
-    for legacy_path in legacy_paths:
-        if osp.abspath(legacy_path) != osp.abspath(canonical) and osp.isfile(
-            legacy_path
-        ):
-            return legacy_path
+    for legacy_path in legacy_annotation_paths(
+        image_path,
+        output_dir=output_dir,
+        image_root=image_root,
+        image_paths=image_paths,
+    ):
+        return legacy_path
     return canonical

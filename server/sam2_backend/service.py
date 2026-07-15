@@ -114,23 +114,19 @@ class Sam2Service:
         }
 
     def readiness(self):
-        if self._predictor is not None:
-            return {"ready": True, "model": self.model_name}
-        missing = []
-        if not self._model_cfg:
-            missing.append("SAM2_MODEL_CFG")
-        elif not os.path.isfile(self._model_cfg):
-            missing.append("SAM2_MODEL_CFG file")
-        if not self._checkpoint:
-            missing.append("SAM2_CHECKPOINT")
-        elif not os.path.isfile(self._checkpoint):
-            missing.append("SAM2_CHECKPOINT file")
+        try:
+            with self._lock:
+                self._ensure_predictor()
+        except Sam2ServiceError as exc:
+            return {
+                "ready": False,
+                "model": self.model_name,
+                "detail": exc.detail,
+            }
         return {
-            "ready": not missing,
+            "ready": True,
             "model": self.model_name,
-            "detail": None
-            if not missing
-            else "Missing or invalid: {}".format(", ".join(missing)),
+            "detail": None,
         }
 
     def register_image(self, image_bytes, client_frame_key=None):
@@ -282,19 +278,24 @@ class Sam2Service:
                 503,
                 "SAM2_MODEL_CFG and SAM2_CHECKPOINT must be set before inference.",
             )
+        if not os.path.isfile(self._model_cfg) or not os.path.isfile(self._checkpoint):
+            raise Sam2ServiceError(
+                503,
+                "SAM2_MODEL_CFG and SAM2_CHECKPOINT must reference existing files.",
+            )
         try:
             import torch
             from sam2.build_sam import build_sam2
             from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+            model = build_sam2(self._model_cfg, self._checkpoint, device=self._device)
+            self._predictor = SAM2ImagePredictor(model)
+            self._torch = torch
         except Exception as exc:
             raise Sam2ServiceError(
                 503,
-                "SAM2 is not installed in this backend environment.",
+                "SAM2 predictor initialization failed: {}".format(exc),
             ) from exc
-
-        model = build_sam2(self._model_cfg, self._checkpoint, device=self._device)
-        self._predictor = SAM2ImagePredictor(model)
-        self._torch = torch
 
     @contextlib.contextmanager
     def _inference_context(self):
