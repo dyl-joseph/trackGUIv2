@@ -43,7 +43,7 @@ def canonical_annotation_path(image_path, output_dir=None, image_root=None):
             osp.dirname(image_path).encode("utf-8")
         ).hexdigest()[:12]
         relative_path = osp.join("_external", parent_key, relative_path)
-    return osp.join(osp.abspath(output_dir), _replace_extension(relative_path))
+    return osp.join(osp.abspath(output_dir), relative_path + ".json")
 
 
 def legacy_annotation_paths(
@@ -57,10 +57,11 @@ def legacy_annotation_paths(
         return []
     canonical = canonical_annotation_path(image_path, output_dir, image_root)
     basename = osp.basename(image_path)
+    legacy_basename = _replace_extension(basename)
     matching_basenames = [
         path
         for path in image_paths
-        if osp.basename(osp.normpath(str(path))) == basename
+        if _replace_extension(osp.basename(osp.normpath(str(path)))) == legacy_basename
     ]
     if len(matching_basenames) > 1:
         return []
@@ -70,7 +71,7 @@ def legacy_annotation_paths(
         candidates.append(
             osp.join(osp.abspath(output_dir), _replace_extension(basename))
         )
-    if image_root:
+    elif image_root:
         candidates.append(
             osp.join(osp.abspath(image_root), _replace_extension(basename))
         )

@@ -2,6 +2,7 @@ import pytest
 
 from labelme.widgets.deletetrack_dialog import DeletionDialog
 from labelme.widgets.interpolation_dialog import InterpolationDialog
+from labelme.widgets.track_dialog import TrackDialog
 
 
 @pytest.mark.gui
@@ -40,3 +41,13 @@ def test_interpolation_dialog_rejects_missing_identity(qtbot):
 
     with pytest.raises(ValueError, match="label and ID"):
         dialog.options()
+
+
+@pytest.mark.gui
+def test_sort_dialog_allows_scratch_range_and_defaults_to_sequence_end(qtbot):
+    dialog = TrackDialog(current_frame=10, total_frames=20)
+    qtbot.addWidget(dialog)
+
+    assert dialog.end_frame.minimum() == 1
+    assert dialog.end_frame.maximum() == 20
+    assert dialog.end_frame.value() == 20

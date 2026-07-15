@@ -1,17 +1,41 @@
 import gc
 from pathlib import Path
 
+import gdown
+
+DEFAULT_MODEL_NAME = "yolo11n.pt"
+DEFAULT_MODEL_URL = (
+    "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt"
+)
+DEFAULT_MODEL_SHA256 = (
+    "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+)
+
+
+def _download_default_model():
+    return gdown.cached_download(
+        url=DEFAULT_MODEL_URL,
+        hash="sha256:{}".format(DEFAULT_MODEL_SHA256),
+    )
+
 
 def _resolve_model_path(model_name):
     model_path = Path(model_name).expanduser()
-    if model_path.is_absolute() or model_path.exists():
+    if model_path.is_file():
         return str(model_path)
+    if model_path.is_absolute():
+        raise FileNotFoundError("YOLO model file does not exist: {}".format(model_path))
 
     packaged_model_path = Path(__file__).resolve().parents[1] / "icons" / model_name
-    if packaged_model_path.exists():
+    if packaged_model_path.is_file():
         return str(packaged_model_path)
 
-    return model_name
+    if model_name == DEFAULT_MODEL_NAME:
+        return _download_default_model()
+    raise FileNotFoundError(
+        "YOLO model {!r} is not a local file; only the verified default model "
+        "is downloaded automatically.".format(model_name)
+    )
 
 
 def _compute_iou(box1, box2):
@@ -27,7 +51,7 @@ def _compute_iou(box1, box2):
 
 
 class BoTSORTForwardTracker:
-    def __init__(self, model_name="yolo11n.pt", device=None):
+    def __init__(self, model_name=DEFAULT_MODEL_NAME, device=None):
         import torch
         from ultralytics import YOLO
 

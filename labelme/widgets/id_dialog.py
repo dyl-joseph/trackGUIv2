@@ -106,6 +106,8 @@ class IDDialog(QtWidgets.QDialog):
 
     def addIDHistory(self, id):
         id = _id_text(id)
+        if not id.strip():
+            return
         if self.IDList.findItems(id, QtCore.Qt.MatchExactly):
             return
         self.IDList.addItem(id)

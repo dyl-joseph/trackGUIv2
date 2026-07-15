@@ -1,5 +1,21 @@
 import math
 
+import cv2
+import numpy as np
+
+from labelme.label_file import LabelFile
+
+
+def load_oriented_cv_image(image_path):
+    """Decode a frame after applying the same EXIF orientation as the GUI."""
+    image_data = LabelFile.load_image_file(image_path)
+    if image_data is None:
+        return None
+    encoded = np.frombuffer(image_data, dtype=np.uint8)
+    if encoded.size == 0:
+        return None
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
 
 def shape_track_id(shape):
     value = shape.get("track_id")
@@ -48,6 +64,35 @@ def normalized_rectangle_points(points):
     return [[left, top], [right, bottom]]
 
 
+def intersect_xyxy_with_image(bbox, image_width, image_height):
+    """Intersect an ordered ``[x1, y1, x2, y2]`` box with an image."""
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("target image dimensions must be positive")
+    try:
+        x1, y1, x2, y2 = bbox
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rectangle must contain four coordinates") from exc
+    values = (x1, y1, x2, y2)
+    if any(isinstance(value, bool) for value in values):
+        raise ValueError("rectangle coordinates must be finite numbers")
+    try:
+        x1, y1, x2, y2 = (float(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rectangle coordinates must be finite numbers") from exc
+    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+        raise ValueError("rectangle coordinates must be finite numbers")
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("rectangle must have ordered, positive-size coordinates")
+
+    left = max(0.0, x1)
+    top = max(0.0, y1)
+    right = min(float(image_width), x2)
+    bottom = min(float(image_height), y2)
+    if right <= left or bottom <= top:
+        raise ValueError("rectangle does not intersect the image")
+    return [[left, top], [right, bottom]]
+
+
 def prediction_to_clamped_rectangle(prediction, image_width, image_height):
     """Convert a center/size prediction to a finite, in-image rectangle."""
     if image_width <= 0 or image_height <= 0:
@@ -70,17 +115,27 @@ def prediction_to_clamped_rectangle(prediction, image_width, image_height):
     if width <= 0 or height <= 0:
         raise ValueError("interpolation predicted a non-positive box size")
 
-    x1 = min(max(0.0, center_x - width / 2), max(0.0, image_width - 1.0))
-    y1 = min(max(0.0, center_y - height / 2), max(0.0, image_height - 1.0))
-    x2 = min(max(0.0, center_x + width / 2), float(image_width))
-    y2 = min(max(0.0, center_y + height / 2), float(image_height))
-    if x2 <= x1 or y2 <= y1:
-        raise ValueError("interpolation produced an empty box")
-    return [[x1, y1], [x2, y2]]
+    try:
+        return intersect_xyxy_with_image(
+            [
+                center_x - width / 2,
+                center_y - height / 2,
+                center_x + width / 2,
+                center_y + height / 2,
+            ],
+            image_width,
+            image_height,
+        )
+    except ValueError as exc:
+        if "does not intersect" in str(exc):
+            raise ValueError("interpolation produced an empty box") from exc
+        raise
 
 
 def upsert_tracked_rectangle(shapes, label, track_id, points, group_id=None):
     """Replace duplicate tracked rectangles while preserving stored metadata."""
+    if track_id is None or (isinstance(track_id, str) and not track_id.strip()):
+        raise ValueError("a non-empty track ID is required for tracked rectangles")
     matching = [
         shape
         for shape in shapes

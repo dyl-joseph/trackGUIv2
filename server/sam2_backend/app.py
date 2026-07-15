@@ -1,3 +1,4 @@
+import json
 import math
 import os
 
@@ -10,6 +11,7 @@ from fastapi import HTTPException
 from fastapi import UploadFile
 from pydantic import BaseModel
 from pydantic import field_validator
+from starlette.concurrency import run_in_threadpool
 
 from .auth import bearer_token_is_valid
 from .service import Sam2Service
@@ -18,6 +20,103 @@ from .service import Sam2ServiceError
 app = FastAPI(title="Hosted SAM2 Bbox Backend")
 service = Sam2Service.from_env()
 api_token = os.environ.get("SAM2_API_TOKEN")
+MAX_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+
+
+class RequestBodyTooLarge(Exception):
+    pass
+
+
+class IngressGuardMiddleware:
+    """Authenticate and cap request bodies before Starlette parses multipart."""
+
+    protected_paths = {"/v1/images", "/v1/point-prompts"}
+
+    def __init__(
+        self,
+        app,
+        max_body_bytes_getter,
+        token_getter,
+        multipart_overhead_bytes=MAX_MULTIPART_OVERHEAD_BYTES,
+    ):
+        self.app = app
+        self.max_body_bytes_getter = max_body_bytes_getter
+        self.token_getter = token_getter
+        self.multipart_overhead_bytes = int(multipart_overhead_bytes)
+
+    @staticmethod
+    async def _send_error(send, status_code, detail):
+        body = json.dumps({"detail": detail}).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope, receive, send):
+        path = (scope.get("path") or "").rstrip("/") or "/"
+        if scope.get("type") != "http" or path not in self.protected_paths:
+            await self.app(scope, receive, send)
+            return
+
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        authorization = headers.get(b"authorization", b"").decode(
+            "latin-1", errors="replace"
+        )
+        if not bearer_token_is_valid(self.token_getter(), authorization):
+            await self._send_error(send, 401, "Invalid bearer token.")
+            return
+
+        max_body_bytes = (
+            int(self.max_body_bytes_getter()) + self.multipart_overhead_bytes
+        )
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                declared_length = None
+            if declared_length is not None and declared_length > max_body_bytes:
+                await self._send_error(send, 413, "Request body exceeds ingress limit.")
+                return
+
+        received_bytes = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal received_bytes
+            message = await receive()
+            if message.get("type") == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > max_body_bytes:
+                    raise RequestBodyTooLarge
+            return message
+
+        async def tracked_send(message):
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except RequestBodyTooLarge:
+            if response_started:
+                raise
+            await self._send_error(send, 413, "Request body exceeds ingress limit.")
+
+
+app.add_middleware(
+    IngressGuardMiddleware,
+    max_body_bytes_getter=lambda: service.max_upload_bytes,
+    token_getter=lambda: api_token,
+)
 
 
 class PointPromptRequest(BaseModel):
@@ -75,7 +174,8 @@ async def register_image(
 ):
     try:
         image_bytes = await image.read(service.max_upload_bytes + 1)
-        return service.register_image(
+        return await run_in_threadpool(
+            service.register_image,
             image_bytes,
             client_frame_key=client_frame_key,
         )

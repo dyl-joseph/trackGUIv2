@@ -1,6 +1,7 @@
 import pytest
 
 from labelme.tracking_utils import interpolation_indices
+from labelme.tracking_utils import intersect_xyxy_with_image
 from labelme.tracking_utils import normalized_rectangle_points
 from labelme.tracking_utils import prediction_to_clamped_rectangle
 from labelme.tracking_utils import upsert_tracked_rectangle
@@ -95,6 +96,29 @@ def test_prediction_to_clamped_rectangle_clamps_to_target_image():
     ]
 
 
+@pytest.mark.parametrize(
+    "prediction",
+    [
+        [-10, 5, 2, 2],
+        [20, 5, 2, 2],
+        [5, -10, 2, 2],
+        [5, 20, 2, 2],
+    ],
+)
+def test_prediction_to_clamped_rectangle_rejects_fully_offscreen_box(prediction):
+    with pytest.raises(ValueError, match="empty box"):
+        prediction_to_clamped_rectangle(prediction, 10, 10)
+
+
+def test_rectangle_intersection_clips_partial_overlap_without_creating_border_box():
+    assert intersect_xyxy_with_image([-5, 2, 3, 15], 10, 10) == [
+        [0.0, 2.0],
+        [3.0, 10.0],
+    ]
+    with pytest.raises(ValueError, match="does not intersect"):
+        intersect_xyxy_with_image([11, 2, 15, 8], 10, 10)
+
+
 def test_upsert_refuses_to_convert_conflicting_nonrectangle():
     shapes = [
         {
@@ -107,3 +131,31 @@ def test_upsert_refuses_to_convert_conflicting_nonrectangle():
 
     with pytest.raises(ValueError, match="non-rectangle"):
         upsert_tracked_rectangle(shapes, "person", 2, [[2, 2], [4, 4]])
+
+
+def test_upsert_refuses_missing_id_without_collapsing_untracked_rectangles():
+    shapes = [
+        {
+            "label": "person",
+            "track_id": None,
+            "group_id": None,
+            "points": [[0, 0], [2, 2]],
+            "shape_type": "rectangle",
+        },
+        {
+            "label": "person",
+            "track_id": None,
+            "group_id": None,
+            "points": [[3, 3], [5, 5]],
+            "shape_type": "rectangle",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="track ID"):
+        upsert_tracked_rectangle(shapes, "person", None, [[6, 6], [8, 8]])
+
+    assert len(shapes) == 2
+    assert [shape["points"] for shape in shapes] == [
+        [[0, 0], [2, 2]],
+        [[3, 3], [5, 5]],
+    ]

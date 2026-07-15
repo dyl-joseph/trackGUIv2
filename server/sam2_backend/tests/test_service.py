@@ -1,5 +1,7 @@
 import hashlib
 import io
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -152,6 +154,42 @@ def test_readiness_surfaces_predictor_initialization_failure(monkeypatch):
 
     assert readiness["ready"] is False
     assert readiness["detail"] == "checkpoint is incompatible"
+
+
+def test_predictor_accepts_installed_package_hydra_config_name(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    calls = []
+
+    def build_sam2(model_cfg, checkpoint_path, device):
+        calls.append((model_cfg, checkpoint_path, device))
+        return object()
+
+    class FakeImagePredictor:
+        def __init__(self, model):
+            self.model = model
+
+    sam2_package = types.ModuleType("sam2")
+    sam2_package.__path__ = []
+    build_module = types.ModuleType("sam2.build_sam")
+    build_module.build_sam2 = build_sam2
+    predictor_module = types.ModuleType("sam2.sam2_image_predictor")
+    predictor_module.SAM2ImagePredictor = FakeImagePredictor
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    monkeypatch.setitem(sys.modules, "sam2", sam2_package)
+    monkeypatch.setitem(sys.modules, "sam2.build_sam", build_module)
+    monkeypatch.setitem(sys.modules, "sam2.sam2_image_predictor", predictor_module)
+    config_name = "configs/sam2.1/sam2.1_hiera_l.yaml"
+    service = Sam2Service(
+        model_cfg=config_name,
+        checkpoint=str(checkpoint),
+        device="cpu",
+    )
+
+    service._ensure_predictor()
+
+    assert calls == [(config_name, str(checkpoint), "cpu")]
+    assert isinstance(service._predictor, FakeImagePredictor)
 
 
 def test_point_prompt_rejects_boolean_label_and_invalid_image_id():

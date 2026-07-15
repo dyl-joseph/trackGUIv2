@@ -18,7 +18,7 @@ pip install -e /path/to/sam2
 Set the SAM2 model config and checkpoint before starting:
 
 ```bash
-export SAM2_MODEL_CFG=/path/to/sam2/configs/sam2.1/sam2.1_hiera_l.yaml
+export SAM2_MODEL_CFG=configs/sam2.1/sam2.1_hiera_l.yaml
 export SAM2_CHECKPOINT=/path/to/checkpoints/sam2.1_hiera_large.pt
 export SAM2_DEVICE=cuda
 export SAM2_API_TOKEN='replace-with-a-long-random-secret'
@@ -28,6 +28,10 @@ export SAM2_MAX_PIXELS=40000000
 export SAM2_CACHE_FRAMES=8
 uvicorn server.sam2_backend.app:app --host 0.0.0.0 --port 9090
 ```
+
+`SAM2_MODEL_CFG` is the Hydra config name shipped by the installed `sam2`
+package, not an arbitrary absolute YAML filename. `SAM2_CHECKPOINT` is a normal
+filesystem path and must exist.
 
 Point the GUI at the server with either `hosted_sam2.url` in `.labelmerc` or:
 

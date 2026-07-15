@@ -38,6 +38,8 @@ from labelme.shape import Shape
 from labelme.track_algo import KalmanBoxTracker
 from labelme.track_algo import SORT_main
 from labelme.tracking_utils import interpolation_indices
+from labelme.tracking_utils import intersect_xyxy_with_image
+from labelme.tracking_utils import load_oriented_cv_image
 from labelme.tracking_utils import normalized_rectangle_points
 from labelme.tracking_utils import prediction_to_clamped_rectangle
 from labelme.tracking_utils import shape_track_id
@@ -205,7 +207,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.IDDialog = IDDialog(
             parent=self,
-            ids=self._config["labels"],
+            ids=[],
             sort_ids=self._config["sort_labels"],
             show_text_field=self._config["show_label_text_field"],
             completion=self._config["label_completion"],
@@ -1320,21 +1322,24 @@ class MainWindow(QtWidgets.QMainWindow):
             image_root=self.lastOpenDir,
         )
 
-    def _legacyAnnotationSources(self, image_path, destination):
-        """Return unambiguous legacy sources that a canonical save retires."""
+    def _legacyAnnotationSources(self, image_path, label_file, destination):
+        """Return only the legacy source actually loaded for this save."""
+        source = getattr(label_file, "filename", None) if label_file else None
         canonical = self._canonicalJsonPath(image_path)
-        if not canonical or not destination:
+        if not source or not canonical or not destination:
             return []
+        source = osp.abspath(source)
         canonical = osp.abspath(canonical)
         destination = osp.abspath(destination)
         if destination != canonical:
             return []
-        return legacy_annotation_paths(
+        candidates = legacy_annotation_paths(
             image_path,
             output_dir=self.output_dir,
             image_root=self.lastOpenDir,
             image_paths=self.imageList,
         )
+        return [source] if source in candidates else []
 
     def _loadLabelForImage(self, image_path):
         path = self._resolveJsonPath(image_path=image_path, for_write=False)
@@ -1356,11 +1361,10 @@ class MainWindow(QtWidgets.QMainWindow):
         image_height = label_file.imageHeight if label_file else None
         image_width = label_file.imageWidth if label_file else None
         if not image_height or not image_width:
-            reader = QtGui.QImageReader(image_path)
-            size = reader.size()
-            if not size.isValid():
+            image = load_oriented_cv_image(image_path)
+            if image is None:
                 raise LabelFileError("Cannot read target image: {}".format(image_path))
-            image_width, image_height = size.width(), size.height()
+            image_height, image_width = image.shape[:2]
         image_data = None
         if label_file and label_file.imageDataEmbedded:
             image_data = label_file.imageData
@@ -1378,7 +1382,9 @@ class MainWindow(QtWidgets.QMainWindow):
             otherData=label_file.otherData if label_file else {},
             flags=label_file.flags if label_file else {},
         )
-        legacy_sources = self._legacyAnnotationSources(image_path, destination)
+        legacy_sources = self._legacyAnnotationSources(
+            image_path, label_file, destination
+        )
         if legacy_sources:
             request["_retire_sources"] = legacy_sources
         return request
@@ -1517,6 +1523,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._explicit_label_path = None
         self.imagePath = None
         self.imageData = None
+        self.image = QtGui.QImage()
         self.labelFile = None
         self.otherData = None
         self.canvas.resetState(release_ai_model=release_ai_model)
@@ -1571,11 +1578,13 @@ class MainWindow(QtWidgets.QMainWindow):
     # Callbacks
 
     def undoShapeEdit(self):
-        self.canvas.restoreShape()
+        if not self.canvas.restoreShape():
+            return False
         self.labelList.clear()
         self.IDList.clear()
         self.loadShapes(self.canvas.shapes)
-        self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
+        self.setDirty()
+        return True
 
     def tutorial(self):
         url = "https://github.com/wkentaro/labelme/tree/main/examples/tutorial"  # NOQA
@@ -1715,23 +1724,37 @@ class MainWindow(QtWidgets.QMainWindow):
 
         tracker = SORT_main(max_age=1, min_hits=1, iou_threshold=0.1)
         KalmanBoxTracker.count = 0
+        seeded_id_values = {}
         if dialog.option_value == 2:
-            seed_ids = []
+            seed_identity_keys = set()
             for shape_index, box in frame_data[0][3]:
                 value = shape_track_id(frame_data[0][2][shape_index])
                 try:
-                    tracker_id = int(value)
-                except (TypeError, ValueError):
+                    if isinstance(value, bool):
+                        raise ValueError
+                    numeric_value = float(value)
+                    if not math.isfinite(numeric_value):
+                        raise ValueError
+                except (TypeError, ValueError, OverflowError):
                     self.errorMessage(
                         "Track IDs",
                         "Every seed rectangle must have a numeric track ID.",
                     )
                     return
+                identity_key = (type(value).__name__, repr(value))
+                if identity_key in seed_identity_keys:
+                    self.errorMessage(
+                        "Track IDs",
+                        "Every seed rectangle must have a unique track ID.",
+                    )
+                    return
+                seed_identity_keys.add(identity_key)
+                tracker_id = len(seeded_id_values)
+                seeded_id_values[tracker_id] = value
                 tracker.trackers.append(
                     KalmanBoxTracker(np.asarray(box, dtype=float), id=tracker_id)
                 )
-                seed_ids.append(tracker_id)
-            KalmanBoxTracker.count = max(seed_ids, default=-1) + 1
+            KalmanBoxTracker.count = len(seeded_id_values)
 
         requests = []
         try:
@@ -1766,10 +1789,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 changed = False
                 for shape_row, track_column in zip(shape_rows, track_columns):
                     shape_index = rectangles[shape_row][0]
-                    new_id = str(int(tracks[track_column, 4]))
-                    if str(shape_track_id(shapes[shape_index])) != new_id:
+                    internal_id = int(tracks[track_column, 4])
+                    is_seeded_id = internal_id in seeded_id_values
+                    new_id = (
+                        seeded_id_values[internal_id]
+                        if is_seeded_id
+                        else str(internal_id)
+                    )
+                    current_id = shape_track_id(shapes[shape_index])
+                    if type(current_id) is not type(new_id) or current_id != new_id:
                         shapes[shape_index]["track_id"] = new_id
-                        shapes[shape_index]["group_id"] = int(new_id)
+                        shapes[shape_index]["group_id"] = (
+                            new_id if is_seeded_id else internal_id
+                        )
                         changed = True
                 if changed:
                     requests.append(
@@ -1905,13 +1937,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 image_path = self.imageList[image_index]
                 label_file = self._loadLabelForImage(image_path)
                 shapes = list(label_file.shapes) if label_file else []
-                reader = QtGui.QImageReader(image_path)
-                size = reader.size()
-                if not size.isValid():
+                image = load_oriented_cv_image(image_path)
+                if image is None:
                     raise ValueError("Cannot read target image: {}".format(image_path))
 
                 points = prediction_to_clamped_rectangle(
-                    predictions[offset], size.width(), size.height()
+                    predictions[offset], image.shape[1], image.shape[0]
                 )
 
                 shapes = upsert_tracked_rectangle(
@@ -2004,13 +2035,43 @@ class MainWindow(QtWidgets.QMainWindow):
         if mode not in {"Remove Box", "Swap ID", "Swap Label"}:
             self.errorMessage("Track Modification", "Unsupported modification mode.")
             return
+        if mode == "Swap ID" and str(new_id) == str(track_id):
+            self.informationMessage(
+                "Track Modification",
+                f"Track {label}-{track_id} already has ID {new_id}; "
+                "no files were changed.",
+            )
+            return
+        if mode == "Swap Label" and new_label == label:
+            self.informationMessage(
+                "Track Modification",
+                f"Track {label}-{track_id} already has label {new_label}; "
+                "no files were changed.",
+            )
+            return
         if not self._ensureSavedForWorkflow("Track Modification"):
             return
 
-        def matches(shape, wanted_id=track_id):
+        def identity_matches(shape, wanted_id=track_id):
             return shape.get("label") == label and str(shape_track_id(shape)) == str(
                 wanted_id
             )
+
+        def validate_box(shape, role):
+            if shape.get("shape_type") != "rectangle":
+                raise ValueError(
+                    "{} {}-{} collides with a non-rectangle shape.".format(
+                        role, label, shape_track_id(shape)
+                    )
+                )
+            try:
+                normalized_rectangle_points(shape.get("points"))
+            except ValueError as exc:
+                raise ValueError(
+                    "{} {}-{} has invalid rectangle geometry: {}".format(
+                        role, label, shape_track_id(shape), exc
+                    )
+                ) from exc
 
         def set_track_id(shape, value):
             shape["track_id"] = value
@@ -2024,13 +2085,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 if label_file is None:
                     continue
                 shapes = label_file.shapes
-                frame_has_source = any(matches(shape) for shape in shapes)
-                source_count += sum(matches(shape) for shape in shapes)
+                source_indices = set()
+                for index, shape in enumerate(shapes):
+                    if identity_matches(shape):
+                        validate_box(shape, "Source track")
+                        source_indices.add(index)
+                frame_has_source = bool(source_indices)
+                source_count += len(source_indices)
+                destination_indices = set()
+                if mode == "Swap ID" and frame_has_source:
+                    for index, shape in enumerate(shapes):
+                        if identity_matches(shape, new_id):
+                            validate_box(shape, "Destination track")
+                            destination_indices.add(index)
+                if mode == "Swap Label" and frame_has_source:
+                    for index, shape in enumerate(shapes):
+                        if shape.get("label") == new_label and str(
+                            shape_track_id(shape)
+                        ) == str(track_id):
+                            validate_box(shape, "Destination track")
+                            destination_indices.add(index)
+                    if destination_indices:
+                        raise ValueError(
+                            "Destination track {}-{} already exists; no labels "
+                            "were changed.".format(new_label, track_id)
+                        )
                 updated_shapes = []
                 changed = False
-                for shape in shapes:
+                for index, shape in enumerate(shapes):
                     shape = dict(shape)
-                    if matches(shape):
+                    if index in source_indices:
                         changed = True
                         if mode == "Remove Box":
                             continue
@@ -2038,12 +2122,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             set_track_id(shape, new_id)
                         elif mode == "Swap Label":
                             shape["label"] = new_label
-                    elif (
-                        mode == "Swap ID"
-                        and frame_has_source
-                        and shape.get("label") == label
-                        and str(shape_track_id(shape)) == new_id
-                    ):
+                    elif index in destination_indices:
                         changed = True
                         set_track_id(shape, track_id)
                     updated_shapes.append(shape)
@@ -2121,6 +2200,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if shape.shape_type != "rectangle" or len(shape.points) != 2:
             self.errorMessage(title, "Only rectangle bounding boxes can be tracked.")
             return None
+        if shape.track_id is None or (
+            isinstance(shape.track_id, str) and not shape.track_id.strip()
+        ):
+            self.errorMessage(title, "Assign a track ID before tracking this box.")
+            return None
         try:
             normalized_rectangle_points(
                 [[point.x(), point.y()] for point in shape.points]
@@ -2159,7 +2243,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if width <= 0 or height <= 0:
             raise ValueError("The selected rectangle is too small to track.")
         report_progress(curr_index + 1, "Initializing CSRT tracker...")
-        current_frame = cv2.imread(image_paths[curr_index])
+        current_frame = load_oriented_cv_image(image_paths[curr_index])
         if current_frame is None:
             raise ValueError("Cannot read current frame image.")
         try:
@@ -2178,7 +2262,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 stop_reason = "canceled"
                 break
             report_progress(index + 1, "Tracking frame {}...".format(index + 1))
-            frame = cv2.imread(image_paths[index])
+            frame = load_oriented_cv_image(image_paths[index])
             if frame is None:
                 stop_reason = "frame {} could not be read".format(index + 1)
                 break
@@ -2190,12 +2274,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if not success:
                 stop_reason = "tracking failed on frame {}".format(index + 1)
                 break
-            box_x, box_y, box_width, box_height = [int(value) for value in bbox]
-            box_x = min(max(0, box_x), max(0, frame.shape[1] - 1))
-            box_y = min(max(0, box_y), max(0, frame.shape[0] - 1))
-            right = min(frame.shape[1], box_x + box_width)
-            bottom = min(frame.shape[0], box_y + box_height)
-            if right <= box_x or bottom <= box_y:
+            box_x, box_y, box_width, box_height = [float(value) for value in bbox]
+            try:
+                points = intersect_xyxy_with_image(
+                    [box_x, box_y, box_x + box_width, box_y + box_height],
+                    frame.shape[1],
+                    frame.shape[0],
+                )
+            except ValueError:
                 stop_reason = "tracker returned an empty box on frame {}".format(
                     index + 1
                 )
@@ -2203,7 +2289,7 @@ class MainWindow(QtWidgets.QMainWindow):
             frames.append(
                 {
                     "image_path": image_paths[index],
-                    "points": [[box_x, box_y], [right, bottom]],
+                    "points": points,
                     "image_shape": frame.shape,
                 }
             )
@@ -2230,7 +2316,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ai_model = None
         try:
             report_progress(curr_index + 1, "Loading YOLO + BoTSORT...")
-            current_frame = cv2.imread(image_paths[curr_index])
+            current_frame = load_oriented_cv_image(image_paths[curr_index])
             if current_frame is None:
                 raise ValueError("Cannot read current frame image.")
             tracker = BoTSORTForwardTracker()
@@ -2263,7 +2349,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 report_progress(
                     index + 1, "Tracking frame {} with BoTSORT...".format(index + 1)
                 )
-                frame = cv2.imread(image_paths[index])
+                frame = load_oriented_cv_image(image_paths[index])
                 if frame is None:
                     stop_reason = "frame {} could not be read".format(index + 1)
                     break
@@ -2296,11 +2382,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if cancel_event.is_set():
                     stop_reason = "canceled"
                     break
-                box_x1 = min(max(0, box_x1), max(0, frame.shape[1] - 1))
-                box_y1 = min(max(0, box_y1), max(0, frame.shape[0] - 1))
-                box_x2 = min(max(0, box_x2), frame.shape[1])
-                box_y2 = min(max(0, box_y2), frame.shape[0])
-                if box_x2 <= box_x1 or box_y2 <= box_y1:
+                try:
+                    points = intersect_xyxy_with_image(
+                        [box_x1, box_y1, box_x2, box_y2],
+                        frame.shape[1],
+                        frame.shape[0],
+                    )
+                except ValueError:
                     stop_reason = "tracker returned an empty box on frame {}".format(
                         index + 1
                     )
@@ -2308,7 +2396,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 frames.append(
                     {
                         "image_path": image_paths[index],
-                        "points": [[box_x1, box_y1], [box_x2, box_y2]],
+                        "points": points,
                         "image_shape": frame.shape,
                     }
                 )
@@ -2776,11 +2864,9 @@ class MainWindow(QtWidgets.QMainWindow):
         bbox = response["bbox"]
         width = self.image.width()
         height = self.image.height()
-        x1 = min(max(float(bbox[0]), 0.0), float(width - 1))
-        y1 = min(max(float(bbox[1]), 0.0), float(height - 1))
-        x2 = min(max(float(bbox[2]), 0.0), float(width))
-        y2 = min(max(float(bbox[3]), 0.0), float(height))
-        if x2 <= x1 or y2 <= y1:
+        try:
+            (x1, y1), (x2, y2) = intersect_xyxy_with_image(bbox, width, height)
+        except ValueError:
             self.errorMessage("Hosted SAM2", "Hosted SAM2 returned an empty bbox.")
             return
 
@@ -2899,7 +2985,8 @@ class MainWindow(QtWidgets.QMainWindow):
         shape = item.shape()
         if shape is None:
             return
-        id = self.IDDialog.popUp(text=shape.track_id)
+        current_id = "" if shape.track_id is None else shape.track_id
+        id = self.IDDialog.popUp(text=current_id)
         if id is None:
             return
         if not str(id).strip():
@@ -3083,11 +3170,12 @@ class MainWindow(QtWidgets.QMainWindow):
             text = "{} ({})".format(shape.label, shape.group_id)
         label_list_item = LabelListWidgetItem(text, shape)
         self.labelList.addItem(label_list_item)
-        id_list_item = IDListWidgetItem(str(shape.track_id), shape)
+        track_id_text = "" if shape.track_id is None else str(shape.track_id)
+        id_list_item = IDListWidgetItem(track_id_text, shape)
         self.IDList.addItem(id_list_item)
         self._ensureLabelSelector(shape.label)
         self.labelDialog.addLabelHistory(shape.label)
-        self.IDDialog.addIDHistory(str(shape.track_id))
+        self.IDDialog.addIDHistory(shape.track_id)
         for action in self.actions.onShapesPresent:
             action.setEnabled(True)
         self._update_shape_color(shape)
@@ -3174,6 +3262,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.loadShapes(shapes, replace=replace)
 
     def _deserializeShapes(self, shapes):
+        def validate_geometry(shape_type, points, shape_number):
+            exact_counts = {
+                "rectangle": 2,
+                "circle": 2,
+                "line": 2,
+                "point": 1,
+                "mask": 2,
+            }
+            minimum_counts = {"polygon": 3, "linestrip": 2, "points": 1}
+            if shape_type in exact_counts and len(points) != exact_counts[shape_type]:
+                raise ValueError(
+                    "shape {} of type {} must have exactly {} points".format(
+                        shape_number, shape_type, exact_counts[shape_type]
+                    )
+                )
+            if (
+                shape_type in minimum_counts
+                and len(points) < minimum_counts[shape_type]
+            ):
+                raise ValueError(
+                    "shape {} of type {} must have at least {} points".format(
+                        shape_number, shape_type, minimum_counts[shape_type]
+                    )
+                )
+            if shape_type in {"rectangle", "mask"}:
+                try:
+                    normalized_rectangle_points(points)
+                except ValueError as exc:
+                    raise ValueError(
+                        "shape {} has invalid {} geometry: {}".format(
+                            shape_number, shape_type, exc
+                        )
+                    ) from exc
+            elif shape_type == "circle" and points[0] == points[1]:
+                raise ValueError(
+                    "shape {} circle must have a positive radius".format(shape_number)
+                )
+
         deserialized = []
         for index, shape_data in enumerate(shapes):
             if not isinstance(shape_data, dict):
@@ -3185,6 +3311,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             points = shape_data["points"]
             shape_type = shape_data["shape_type"]
+            if shape_type not in {
+                "polygon",
+                "rectangle",
+                "point",
+                "line",
+                "circle",
+                "linestrip",
+                "points",
+                "mask",
+            }:
+                raise ValueError(
+                    "shape {} has unsupported type: {}".format(index + 1, shape_type)
+                )
             flags = shape_data["flags"]
             if not isinstance(flags, dict):
                 raise ValueError("shape {} flags must be an object".format(index + 1))
@@ -3200,9 +3339,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if track_id is None or track_id == "":
                 track_id = group_id
 
-            if not points:
-                # skip point-empty shape
-                continue
+            if not isinstance(points, (list, tuple)):
+                raise ValueError("shape {} points must be a sequence".format(index + 1))
             validated_points = []
             for point in points:
                 if not isinstance(point, (list, tuple)) or len(point) != 2:
@@ -3225,6 +3363,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                 validated_points.append([x, y])
             points = validated_points
+            validate_geometry(shape_type, points, index + 1)
+
+            mask = shape_data["mask"]
+            if shape_type == "mask":
+                if mask is None:
+                    raise ValueError("shape {} mask data is required".format(index + 1))
+                try:
+                    mask = np.asarray(mask, dtype=bool)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "shape {} mask must be a non-empty 2D array".format(index + 1)
+                    ) from exc
+                if mask.ndim != 2 or mask.size == 0 or not mask.any():
+                    raise ValueError(
+                        "shape {} mask must be a non-empty 2D array".format(index + 1)
+                    )
 
             if (
                 self.ir_activated
@@ -3258,6 +3412,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         points[1][1] + deltas[1][1],
                     ],
                 ]
+                validate_geometry(shape_type, points, index + 1)
 
             shape = Shape(
                 label=label,
@@ -3265,7 +3420,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 group_id=group_id,
                 track_id=track_id,
                 description=description,
-                mask=shape_data["mask"],
+                mask=mask,
             )
             shape.other_data = other_data
             for x, y in points:
@@ -3345,7 +3500,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 otherData=self.otherData or {},
                 flags=flags,
             )
-            legacy_sources = self._legacyAnnotationSources(self.filename, filename)
+            legacy_sources = self._legacyAnnotationSources(
+                self.filename, self.labelFile, filename
+            )
             if legacy_sources:
                 request["_retire_sources"] = legacy_sources
             save_label_files_atomically([request])
@@ -3424,12 +3581,71 @@ class MainWindow(QtWidgets.QMainWindow):
             self._syncing_visibility = False
 
     def labelOrderChanged(self):
-        self.setDirty()
-        self.canvas.loadShapes([item.shape() for item in self.labelList])
+        self._shapeOrderChanged(self.labelList)
 
     def IDOrderChanged(self):
+        self._shapeOrderChanged(self.IDList)
+
+    def _shapeOrderChanged(self, source_list):
+        shapes = [item.shape() for item in source_list]
+        source_ids = [id(shape) for shape in shapes if shape is not None]
+        canvas_ids = [id(shape) for shape in self.canvas.shapes]
+        if (
+            len(source_ids) != len(shapes)
+            or len(set(source_ids)) != len(source_ids)
+            or len(source_ids) != len(canvas_ids)
+            or set(source_ids) != set(canvas_ids)
+        ):
+            logger.error("Ignoring an invalid shape-list reorder")
+            self._rebuildShapeLists(self.canvas.shapes)
+            self.status(self.tr("Could not apply the requested shape order."))
+            return
+
+        # The canvas order is the authoritative order serialized by the app.
+        # Preserve its undo history, visibility, and selection while rebuilding
+        # both views because Qt's internal move detaches and clones list items.
+        self.canvas.shapes = list(shapes)
+        self.canvas.storeShapes()
+        self.canvas.update()
+        self._rebuildShapeLists(shapes)
         self.setDirty()
-        self.canvas.loadShapes([item.shape() for item in self.IDList])
+
+    def _rebuildShapeLists(self, shapes):
+        shape_ids = {id(shape) for shape in shapes}
+        selected_shapes = [
+            shape for shape in self.canvas.selectedShapes if id(shape) in shape_ids
+        ]
+        visibility = {
+            id(shape): self.canvas.isVisible(shape) for shape in self.canvas.shapes
+        }
+        signal_objects = (
+            self.labelList,
+            self.labelList.model(),
+            self.IDList,
+            self.IDList.model(),
+        )
+        previous_signal_states = [
+            (obj, obj.blockSignals(True)) for obj in signal_objects
+        ]
+        previous_selection_guard = self._noSelectionSlot
+        self._noSelectionSlot = True
+        try:
+            self.labelList.clear()
+            self.IDList.clear()
+            for shape in shapes:
+                self.addLabel(shape)
+                check_state = (
+                    Qt.Checked if visibility.get(id(shape), True) else Qt.Unchecked
+                )
+                self.labelList.findItemByShape(shape).setCheckState(check_state)
+                self.IDList.findItemByShape(shape).setCheckState(check_state)
+        finally:
+            self._noSelectionSlot = previous_selection_guard
+            for obj, was_blocked in reversed(previous_signal_states):
+                obj.blockSignals(was_blocked)
+
+        if not previous_selection_guard:
+            self.shapeSelectionChanged(selected_shapes)
 
     # Callback functions:
 
@@ -3615,15 +3831,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Load the specified file, or the last opened file if None."""
         if not self._flushPendingAutoSave():
             return False
-        # Keep the list selection aligned without recursively re-entering this method.
-        if filename in self.imageList and (
-            self.fileListWidget.currentRow() != self.imageList.index(filename)
-        ):
-            self.fileListWidget.blockSignals(True)
-            try:
-                self.fileListWidget.setCurrentRow(self.imageList.index(filename))
-            finally:
-                self.fileListWidget.blockSignals(False)
 
         if filename is None:  # image file name .jpg
             filename = self.settings.value("filename", "")
@@ -3798,6 +4005,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addRecentFile(self.filename)
         self.toggleActions(True)
         self.canvas.setFocus()
+        # Selection is committed only after image and annotation validation succeeds.
+        if self.filename in self.imageList and (
+            self.fileListWidget.currentRow() != self.imageList.index(self.filename)
+        ):
+            self.fileListWidget.blockSignals(True)
+            try:
+                self.fileListWidget.setCurrentRow(self.imageList.index(self.filename))
+            finally:
+                self.fileListWidget.blockSignals(False)
         self.status(str(self.tr("Loaded %s")) % osp.basename(str(self.filename)))
         return True
 
@@ -3920,7 +4136,12 @@ class MainWindow(QtWidgets.QMainWindow):
             Qt.ControlModifier | Qt.ShiftModifier
         ):
             self._config["keep_prev"] = True
+        try:
+            return self._openPrevImg()
+        finally:
+            self._config["keep_prev"] = keep_prev
 
+    def _openPrevImg(self):
         if not self.mayContinue():
             return
 
@@ -3939,8 +4160,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 filename = self.imageList[currIndex - 1]
                 if filename:
                     self.loadFile(filename)
-
-            self._config["keep_prev"] = keep_prev
         else:
             currIndex = self.INTERPOLATION_list.index(self.filename)
             if currIndex - 1 >= 0:
@@ -3948,15 +4167,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 if filename:
                     self.loadFile(filename)
 
-            self._config["keep_prev"] = keep_prev
-
     def openNextImg(self, _value=False, load=True):
         keep_prev = self._config["keep_prev"]
         if QtWidgets.QApplication.keyboardModifiers() == (
             Qt.ControlModifier | Qt.ShiftModifier
         ):
             self._config["keep_prev"] = True
+        try:
+            return self._openNextImg(load=load)
+        finally:
+            self._config["keep_prev"] = keep_prev
 
+    def _openNextImg(self, load=True):
+        # Refinement deltas are valid for one forward frame load only.
+        self.ir_activated = False
         if not self.mayContinue():
             return
 
@@ -3966,6 +4190,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._flushPendingAutoSave()
 
         if self.mode == "NORMAL" or self.mode == "None":
+            if self.filename is not None:
+                if self.filename not in self.imageList:
+                    return
+                if self.imageList.index(self.filename) + 1 >= len(self.imageList):
+                    return
             if (
                 self.interpolationrefine_list.checkBox.isChecked()
                 and self.ir_name != "None"
@@ -4001,24 +4230,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 filename = self.imageList[0]
             else:
                 currIndex = self.imageList.index(self.filename)
-                if currIndex + 1 < len(self.imageList):
-                    filename = self.imageList[currIndex + 1]
-                else:
-                    filename = self.imageList[-1]
+                filename = self.imageList[currIndex + 1]
             if filename and load:
-                self.loadFile(filename)
-
-            self._config["keep_prev"] = keep_prev
-        else:
-            currIndex = self.INTERPOLATION_list.index(self.filename)
-            if currIndex + 1 < len(self.INTERPOLATION_list):
-                filename = self.INTERPOLATION_list[currIndex + 1]
+                try:
+                    self.loadFile(filename)
+                finally:
+                    self.ir_activated = False
             else:
-                filename = self.INTERPOLATION_list[-1]
+                self.ir_activated = False
+        else:
+            if (
+                not self.INTERPOLATION_list
+                or self.filename not in self.INTERPOLATION_list
+            ):
+                return
+            currIndex = self.INTERPOLATION_list.index(self.filename)
+            if currIndex + 1 >= len(self.INTERPOLATION_list):
+                return
+            filename = self.INTERPOLATION_list[currIndex + 1]
             if filename and load:
                 self.loadFile(filename)
-
-            self._config["keep_prev"] = keep_prev
 
     def openFile(self, _value=False):
         if not self.mayContinue():
@@ -4066,12 +4297,33 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         previous_output_dir = self.output_dir
+        previous_explicit_label_path = self._explicit_label_path
         current_filename = self.filename
         self.output_dir = output_dir
-        self.importDirImages(self.lastOpenDir, load=False)
-        if current_filename and not self.loadFile(current_filename):
+        self._explicit_label_path = None
+        if self.lastOpenDir and not self.importDirImages(
+            self.lastOpenDir, load=False, check_continue=False
+        ):
             self.output_dir = previous_output_dir
-            self.importDirImages(self.lastOpenDir, load=False)
+            self._explicit_label_path = previous_explicit_label_path
+            self.status(
+                self.tr("Could not scan images for the selected annotation directory.")
+            )
+            return
+        keep_prev = self._config["keep_prev"]
+        ir_activated = self.ir_activated
+        try:
+            self._config["keep_prev"] = False
+            self.ir_activated = False
+            loaded = not current_filename or self.loadFile(current_filename)
+        finally:
+            self._config["keep_prev"] = keep_prev
+            self.ir_activated = ir_activated
+        if not loaded:
+            self.output_dir = previous_output_dir
+            self._explicit_label_path = previous_explicit_label_path
+            if self.lastOpenDir:
+                self.importDirImages(self.lastOpenDir, load=False, check_continue=False)
             self._restoreCurrentFileSelection()
             self.status(
                 self.tr("Could not load annotations from the selected directory.")
@@ -4264,7 +4516,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.remLabels(self.canvas.deleteSelected())
         self.setDirty()
-        self.saveFile()
         if self.noShapes():
             for action in self.actions.onShapesPresent:
                 action.setEnabled(False)
@@ -4301,7 +4552,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 | QtWidgets.QFileDialog.DontUseNativeDialog,
             )
         )
-        self.importDirImages(targetDirPath)
+        self.importDirImages(targetDirPath, check_continue=False)
 
     @property
     def imageList(self):
@@ -4360,42 +4611,93 @@ class MainWindow(QtWidgets.QMainWindow):
         if added_files:
             self.loadFile(added_files[0])
 
-    def importDirImages(self, dirpath, pattern=None, load=True):
-        self.actions.openNextImg.setEnabled(True)
-        self.actions.openPrevImg.setEnabled(True)
-
-        if not self.mayContinue() or not dirpath:
-            return
+    def importDirImages(self, dirpath, pattern=None, load=True, check_continue=True):
+        if not dirpath or (check_continue and not self.mayContinue()):
+            return False
 
         current_filename = getattr(self, "filename", None)
-        self.lastOpenDir = osp.abspath(dirpath)
-        self.fileListWidget.clear()
-
+        previous_root = self.lastOpenDir
+        previous_items = [
+            (
+                self.fileListWidget.item(index).text(),
+                self.fileListWidget.item(index).checkState(),
+                self.fileListWidget.item(index).isHidden(),
+            )
+            for index in range(self.fileListWidget.count())
+        ]
+        previous_row = self.fileListWidget.currentRow()
+        previous_next_enabled = self.actions.openNextImg.isEnabled()
+        previous_prev_enabled = self.actions.openPrevImg.isEnabled()
+        new_root = osp.abspath(dirpath)
         filenames = self.scanAllImages(dirpath)
         if pattern:
             try:
                 filenames = [f for f in filenames if re.search(pattern, f)]
             except re.error:
                 pass
-        for filename in filenames:
-            label_file = self._resolveJsonPath(
-                image_path=filename, for_write=False, image_paths=filenames
-            )
-            item = QtWidgets.QListWidgetItem(filename)
-            item.setFlags(
-                Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
-            )
-            if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
-                item.setCheckState(Qt.Checked)
-            else:
-                item.setCheckState(Qt.Unchecked)
-            self.fileListWidget.addItem(item)
-        self._imageListCache = None
-        if load:
-            if filenames and not self.loadFile(filenames[0]):
-                self._restoreCurrentFileSelection()
-        else:
+
+        def populate(items, root, preserve_states=False):
+            self.fileListWidget.blockSignals(True)
+            try:
+                self.fileListWidget.clear()
+                self.lastOpenDir = root
+                paths = [item[0] if preserve_states else item for item in items]
+                for index, filename in enumerate(paths):
+                    item = QtWidgets.QListWidgetItem(filename)
+                    item.setFlags(
+                        Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+                    )
+                    if preserve_states:
+                        item.setCheckState(items[index][1])
+                        item.setHidden(items[index][2])
+                    else:
+                        label_file = self._resolveJsonPath(
+                            image_path=filename,
+                            for_write=False,
+                            image_paths=paths,
+                        )
+                        item.setCheckState(
+                            Qt.Checked
+                            if QtCore.QFile.exists(label_file)
+                            and LabelFile.is_label_file(label_file)
+                            else Qt.Unchecked
+                        )
+                    self.fileListWidget.addItem(item)
+                self._imageListCache = list(paths)
+            finally:
+                self.fileListWidget.blockSignals(False)
+
+        if not filenames:
+            populate([], new_root)
+            self.resetState()
+            self.setClean()
+            self.toggleActions(False)
+            self.canvas.setEnabled(False)
+            self.actions.saveAs.setEnabled(False)
+            self.actions.openNextImg.setEnabled(False)
+            self.actions.openPrevImg.setEnabled(False)
+            self.status(self.tr("No images found in %s") % new_root)
+            return True
+
+        populate(filenames, new_root)
+        if load and not self.loadFile(filenames[0]):
+            populate(previous_items, previous_root, preserve_states=True)
             self.filename = current_filename
+            if 0 <= previous_row < self.fileListWidget.count():
+                self.fileListWidget.blockSignals(True)
+                try:
+                    self.fileListWidget.setCurrentRow(previous_row)
+                finally:
+                    self.fileListWidget.blockSignals(False)
+            self.actions.openNextImg.setEnabled(previous_next_enabled)
+            self.actions.openPrevImg.setEnabled(previous_prev_enabled)
+            return False
+        if not load:
+            self.filename = current_filename
+        navigation_enabled = len(filenames) > 1
+        self.actions.openNextImg.setEnabled(navigation_enabled)
+        self.actions.openPrevImg.setEnabled(navigation_enabled)
+        return True
 
     def scanAllImages(self, folderPath):
         extensions = [

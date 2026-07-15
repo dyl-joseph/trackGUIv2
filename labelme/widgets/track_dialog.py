@@ -13,7 +13,7 @@ class TrackDialog(QtWidgets.QDialog):
         self.button2.clicked.connect(self.option2)
 
         self.end_frame = QtWidgets.QSpinBox()
-        self.end_frame.setRange(max(1, current_frame), max(1, total_frames))
+        self.end_frame.setRange(1, max(1, total_frames))
         self.end_frame.setValue(max(1, total_frames))
         row1 = QtWidgets.QHBoxLayout()
         row1.addWidget(QtWidgets.QLabel("End Frame:"))

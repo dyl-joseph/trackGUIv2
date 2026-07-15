@@ -38,12 +38,25 @@ def load_categories(filename):
 
 def find_label_files(input_dir):
     pattern = osp.join(osp.abspath(input_dir), "**", "*.json")
-    return sorted(glob.glob(pattern, recursive=True))
+    files = glob.glob(pattern, recursive=True)
+    return sorted(
+        filename
+        for filename in files
+        if not any(
+            part.startswith(".")
+            for part in osp.relpath(filename, input_dir).replace("\\", "/").split("/")
+        )
+    )
 
 
 def relative_output_stem(filename, input_dir):
     relative = osp.relpath(osp.abspath(filename), osp.abspath(input_dir))
     return osp.splitext(relative)[0]
+
+
+def portable_dataset_path(path):
+    """Normalize a serialized dataset path to COCO's portable separators."""
+    return str(path).replace("\\", "/")
 
 
 def ensure_parent(filename):
@@ -56,6 +69,39 @@ def shape_points_are_finite(shape):
     except (TypeError, ValueError):
         return False
     return points.ndim == 2 and points.shape[1:] == (2,) and np.isfinite(points).all()
+
+
+def shape_geometry_is_valid(shape):
+    if not shape_points_are_finite(shape):
+        return False
+    points = np.asarray(shape.get("points"), dtype=float)
+    shape_type = shape.get("shape_type", "polygon")
+    if shape_type == "polygon":
+        if len(points) < 3:
+            return False
+        x = points[:, 0]
+        y = points[:, 1]
+        area_twice = np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))
+        return not np.isclose(area_twice, 0.0)
+    if shape_type == "rectangle":
+        return (
+            len(points) == 2
+            and points[0, 0] != points[1, 0]
+            and points[0, 1] != points[1, 1]
+        )
+    if shape_type == "circle":
+        return len(points) == 2 and not np.array_equal(points[0], points[1])
+    if shape_type == "line":
+        return len(points) == 2 and not np.array_equal(points[0], points[1])
+    if shape_type == "linestrip":
+        return len(points) >= 2 and np.any(np.diff(points, axis=0) != 0)
+    if shape_type == "point":
+        return len(points) == 1
+    if shape_type == "points":
+        return len(points) >= 1
+    if shape_type == "mask":
+        return len(points) >= 1 and shape.get("mask") is not None
+    return False
 
 
 def main():
@@ -137,7 +183,9 @@ def main():
             dict(
                 license=0,
                 url=None,
-                file_name=osp.relpath(out_img_file, osp.dirname(out_ann_file)),
+                file_name=portable_dataset_path(
+                    osp.relpath(out_img_file, osp.dirname(out_ann_file))
+                ),
                 height=img.shape[0],
                 width=img.shape[1],
                 date_captured=None,
@@ -149,8 +197,8 @@ def main():
         segmentations = collections.defaultdict(list)  # for segmentation
         requires_rle = collections.defaultdict(bool)
         for shape in label_file.shapes:
-            if not shape_points_are_finite(shape):
-                print("Skipping shape with invalid coordinates in:", filename)
+            if not shape_geometry_is_valid(shape):
+                print("Skipping shape with invalid geometry in:", filename)
                 continue
             points = shape["points"]
             label = shape["label"]

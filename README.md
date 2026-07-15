@@ -60,7 +60,7 @@ TrackMe annotation format is compatible with LabelMe annotation format (.json) w
 
 13. **Track Forward (CSRT)** — Select a rectangle bounding box and press **Ctrl+T** (or Track > Track Forward (CSRT)) to propagate it across subsequent frames using OpenCV's CSRT tracker. Stops automatically if tracking confidence drops (`labelme/app.py`).
 
-14. **Track Forward (BoTSORT)** — Select a rectangle and press **Ctrl+Shift+T** (or Track > Track Forward (BoTSORT)). Uses Ultralytics' cacheable `yolo11n.pt` download for detection and BoTSORT for multi-object association; clean installations no longer depend on an ignored repository-local weight file. IOU-matches the user's bbox to a YOLO detection, then follows that track across frames. More robust than CSRT for occlusion and scale changes. Includes optional "Refine with EfficientSAM" checkbox to tighten each tracked bbox using AI segmentation (`labelme/app.py`, `labelme/track_algo/botsort_tracker.py`).
+14. **Track Forward (BoTSORT)** — Select a rectangle and press **Ctrl+Shift+T** (or Track > Track Forward (BoTSORT)). Uses the pinned Ultralytics `yolo11n.pt` v8.3.0 release asset for detection and BoTSORT for multi-object association. The model is downloaded through `gdown`'s user cache and verified against the SHA-256 recorded in `labelme/track_algo/botsort_tracker.py`; a checksum mismatch is rejected. Custom models must be supplied as local files. IOU-matches the user's bbox to a YOLO detection, then follows that track across frames. More robust than CSRT for occlusion and scale changes. Includes optional "Refine with EfficientSAM" checkbox to tighten each tracked bbox using AI segmentation (`labelme/app.py`, `labelme/track_algo/botsort_tracker.py`).
 
 15. **Refine Bbox (AI)** — Select one or more rectangles and press **R** (or Track > Refine Bbox (AI)). Uses EfficientSAM with a 5-point box prompt (4 corners + center) to generate a segmentation mask, then extracts a tighter bounding box clipped to the original region. Works with any bbox source — BoTSORT, CSRT, manual, or SORT (`labelme/app.py`, `labelme/ai/efficient_sam.py`).
 
@@ -112,9 +112,14 @@ labelme
 
 - JSON writes are staged, flushed, and atomically replaced. Multi-frame tracking,
   interpolation, and modification operations validate all outputs before committing.
+  Batch rollback covers reported Python/filesystem errors; each individual JSON is
+  crash-safe, but a process or power loss between files can leave a batch partially
+  committed. Hidden transaction artifacts use a non-JSON `.tmp` suffix and are never
+  treated as exporter inputs.
 - When an output directory is configured, image subdirectories are mirrored there
   (for example, `images/camera1/frame.jpg` becomes
-  `annotations/camera1/frame.json`), preventing duplicate basenames from colliding.
+  `annotations/camera1/frame.jpg.json`), preventing duplicate basenames and
+  same-stem images with different extensions from colliding.
 - Legacy flat output files are read only when the basename is unambiguous and are
   migrated to the nested path on the next save.
 

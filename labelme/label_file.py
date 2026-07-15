@@ -4,6 +4,8 @@ import io
 import json
 import os
 import os.path as osp
+import secrets
+import stat
 import tempfile
 
 import numpy as np
@@ -32,6 +34,34 @@ def open(name, mode):
 
 class LabelFileError(Exception):
     pass
+
+
+def _create_atomic_temp(directory, prefix, suffix):
+    """Create a sibling temp with the normal mode for a newly created file.
+
+    ``tempfile.mkstemp`` deliberately forces mode 0600.  That is a sensible
+    default for temporary files, but installing such a file with ``replace``
+    unexpectedly makes every annotation private.  Let the operating system
+    apply the process umask to 0666, remember that result, and restrict the
+    file while it is being populated.
+    """
+    for _ in range(100):
+        path = osp.join(
+            directory, "{}{}{}".format(prefix, secrets.token_hex(8), suffix)
+        )
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        new_file_mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            os.close(fd)
+            os.unlink(path)
+            raise
+        return fd, path, new_file_mode
+    raise FileExistsError("Could not create a unique annotation temporary file")
 
 
 class LabelFile(object):
@@ -285,10 +315,14 @@ class LabelFile(object):
         temporary_path = None
         try:
             os.makedirs(directory, exist_ok=True)
-            fd, temporary_path = tempfile.mkstemp(
-                dir=directory,
-                prefix=".{}-".format(osp.basename(filename)),
-                suffix=".tmp",
+            try:
+                destination_mode = stat.S_IMODE(os.stat(filename).st_mode)
+            except FileNotFoundError:
+                destination_mode = None
+            fd, temporary_path, new_file_mode = _create_atomic_temp(
+                directory,
+                ".{}-".format(osp.basename(filename)),
+                ".tmp",
             )
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(
@@ -300,6 +334,10 @@ class LabelFile(object):
                 )
                 handle.flush()
                 os.fsync(handle.fileno())
+            os.chmod(
+                temporary_path,
+                new_file_mode if destination_mode is None else destination_mode,
+            )
             os.replace(temporary_path, filename)
             temporary_path = None
             self.filename = filename
@@ -363,7 +401,7 @@ def save_label_files_atomically(requests):
             fd, stage_path = tempfile.mkstemp(
                 dir=directory,
                 prefix=".{}-stage-".format(osp.basename(destination)),
-                suffix=".json",
+                suffix=".tmp",
             )
             os.close(fd)
             os.unlink(stage_path)
@@ -376,10 +414,12 @@ def save_label_files_atomically(requests):
         for stage_path, destination in staged:
             backup_path = None
             if osp.exists(destination):
+                destination_mode = stat.S_IMODE(os.stat(destination).st_mode)
+                os.chmod(stage_path, destination_mode)
                 fd, backup_path = tempfile.mkstemp(
                     dir=osp.dirname(destination),
                     prefix=".{}-backup-".format(osp.basename(destination)),
-                    suffix=".json",
+                    suffix=".tmp",
                 )
                 os.close(fd)
                 os.unlink(backup_path)
@@ -395,7 +435,7 @@ def save_label_files_atomically(requests):
             fd, retired_path = tempfile.mkstemp(
                 dir=osp.dirname(source),
                 prefix=".{}-migrated-".format(osp.basename(source)),
-                suffix=".json",
+                suffix=".tmp",
             )
             os.close(fd)
             os.unlink(retired_path)

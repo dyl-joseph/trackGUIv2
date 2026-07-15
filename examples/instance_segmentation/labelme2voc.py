@@ -16,7 +16,15 @@ import labelme
 
 def find_label_files(input_dir):
     pattern = osp.join(osp.abspath(input_dir), "**", "*.json")
-    return sorted(glob.glob(pattern, recursive=True))
+    files = glob.glob(pattern, recursive=True)
+    return sorted(
+        filename
+        for filename in files
+        if not any(
+            part.startswith(".")
+            for part in osp.relpath(filename, input_dir).replace("\\", "/").split("/")
+        )
+    )
 
 
 def relative_output_stem(filename, input_dir):

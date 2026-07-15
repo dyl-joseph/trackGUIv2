@@ -82,7 +82,7 @@ def test_default_mplconfigdir_uses_os_temp_directory():
     assert expected.is_dir()
 
 
-def test_botsort_model_uses_ultralytics_cache_when_not_local(monkeypatch, tmp_path):
+def test_botsort_default_model_uses_verified_cached_download(monkeypatch, tmp_path):
     package_root = tmp_path / "labelme"
     track_algo_dir = package_root / "track_algo"
     run_dir = tmp_path / "run"
@@ -95,5 +95,25 @@ def test_botsort_model_uses_ultralytics_cache_when_not_local(monkeypatch, tmp_pa
         str(track_algo_dir / "botsort_tracker.py"),
     )
     monkeypatch.chdir(run_dir)
+    calls = []
+    cached_model = tmp_path / "cache" / "yolo11n.pt"
 
-    assert botsort_tracker._resolve_model_path("yolo11n.pt") == "yolo11n.pt"
+    def cached_download(**kwargs):
+        calls.append(kwargs)
+        return str(cached_model)
+
+    monkeypatch.setattr(botsort_tracker.gdown, "cached_download", cached_download)
+
+    assert botsort_tracker._resolve_model_path("yolo11n.pt") == str(cached_model)
+    assert calls == [
+        {
+            "url": botsort_tracker.DEFAULT_MODEL_URL,
+            "hash": "sha256:{}".format(botsort_tracker.DEFAULT_MODEL_SHA256),
+        }
+    ]
+
+
+def test_botsort_refuses_an_unverified_implicit_model_download(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(FileNotFoundError, match="only the verified default"):
+        botsort_tracker._resolve_model_path("custom.pt")

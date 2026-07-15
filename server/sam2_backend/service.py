@@ -278,10 +278,10 @@ class Sam2Service:
                 503,
                 "SAM2_MODEL_CFG and SAM2_CHECKPOINT must be set before inference.",
             )
-        if not os.path.isfile(self._model_cfg) or not os.path.isfile(self._checkpoint):
+        if not os.path.isfile(self._checkpoint):
             raise Sam2ServiceError(
                 503,
-                "SAM2_MODEL_CFG and SAM2_CHECKPOINT must reference existing files.",
+                "SAM2_CHECKPOINT must reference an existing file.",
             )
         try:
             import torch

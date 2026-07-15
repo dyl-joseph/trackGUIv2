@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import stat
 
 import numpy as np
 import PIL.Image
@@ -97,14 +99,50 @@ def test_failed_serialization_does_not_truncate_existing_file(tmp_path, monkeypa
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_atomic_save_preserves_existing_file_mode(tmp_path):
+    destination = tmp_path / "annotation.json"
+    destination.write_text('{"original": true}', encoding="utf-8")
+    destination.chmod(0o664)
+
+    LabelFile().save(
+        filename=str(destination),
+        shapes=[_shape()],
+        imagePath="frame.png",
+        imageHeight=3,
+        imageWidth=4,
+    )
+
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o664
+
+
+def test_new_atomic_save_uses_normal_file_mode_with_umask(tmp_path):
+    destination = tmp_path / "annotation.json"
+    previous_umask = os.umask(0o027)
+    try:
+        LabelFile().save(
+            filename=str(destination),
+            shapes=[_shape()],
+            imagePath="frame.png",
+            imageHeight=3,
+            imageWidth=4,
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o640
+
+
 def test_batch_failure_rolls_back_every_destination(tmp_path, monkeypatch):
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
     first.write_text('{"value": "first"}', encoding="utf-8")
     second.write_text('{"value": "second"}', encoding="utf-8")
     original_replace = label_file_module.os.replace
+    stage_paths = []
 
     def fail_second_install(source, destination):
+        if "-stage-" in source:
+            stage_paths.append(source)
         if destination == str(second) and "-stage-" in source:
             raise OSError("commit failed")
         return original_replace(source, destination)
@@ -126,6 +164,32 @@ def test_batch_failure_rolls_back_every_destination(tmp_path, monkeypatch):
 
     assert json.loads(first.read_text(encoding="utf-8")) == {"value": "first"}
     assert json.loads(second.read_text(encoding="utf-8")) == {"value": "second"}
+    assert stage_paths
+    assert all(path.endswith(".tmp") for path in stage_paths)
+
+
+def test_batch_save_preserves_each_existing_destination_mode(tmp_path):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text('{"value": "first"}', encoding="utf-8")
+    second.write_text('{"value": "second"}', encoding="utf-8")
+    first.chmod(0o640)
+    second.chmod(0o664)
+    requests = [
+        dict(
+            filename=str(path),
+            shapes=[_shape(label=path.stem)],
+            imagePath="frame.png",
+            imageHeight=3,
+            imageWidth=4,
+        )
+        for path in (first, second)
+    ]
+
+    save_label_files_atomically(requests)
+
+    assert stat.S_IMODE(first.stat().st_mode) == 0o640
+    assert stat.S_IMODE(second.stat().st_mode) == 0o664
 
 
 def test_loaded_mask_can_be_saved_again_without_losing_pixels(tmp_path):
